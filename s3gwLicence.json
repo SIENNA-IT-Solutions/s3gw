@@ -1,0 +1,48 @@
+{
+  "activated": true,
+  "expires_at": "2030-01-01T00:00:00Z",
+  "gateway": {
+    "enabled": true,
+    "access_key": "S3GW_ACCESSKEY",
+    "secret_key": "4c38d72e61be92d4b68e0d9843c081e3f892a0d1762c"
+  },
+  "bucket": "my-target-bucket",
+  "endpoint": "s3.eu-west-3.amazonaws.com",
+  "region": "eu-west-3",
+  "accessKey": "AKIAX_REAL_S3_ACCESS_KEY",
+  "secretKey": "REAL_S3_SECRET_KEY_abc123",
+  "forceVirtualHost": true,
+  "forcePathStyle": false,
+  "security_policy": {
+    "allowed_countries": [
+      "FR",
+      "DE",
+      "BE",
+      "CH",
+      "US"
+    ],
+    "blocked_countries": [
+      "RU",
+      "CN",
+      "KP",
+      "IR"
+    ],
+    "blocked_asns": [
+      4134,
+      4837,
+      3462
+    ],
+    "allowed_ips": [],
+    "blocked_ips": [
+      "185.220.101.5"
+    ],
+    "allow_admin_operations": false,
+    "ransomware_killswitch": true,
+    "dlp_quotas": {
+      "max_download_bytes_per_hour": 10737418240,
+      "max_get_requests_per_minute": 600,
+      "max_delete_requests_per_minute": 60,
+      "quarantine_duration_seconds": 3600
+    }
+  }
+}

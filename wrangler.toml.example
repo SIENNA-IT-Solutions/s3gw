@@ -1,0 +1,15 @@
+name = "s3gw-firewall"
+main = "s3gwGateway.js"
+compatibility_date = "2026-07-11"
+
+[vars]
+# Replace with your custom domain or Cloudflare Worker hostname
+GATEWAY_HOST = "s3gw.yourdomain.com"
+
+[[kv_namespaces]]
+binding = "LICENSES_KV"
+id = "YOUR_CLOUDFLARE_KV_NAMESPACE_ID"
+
+[[r2_buckets]]
+binding = "R2_GATEWAY"
+bucket_name = "YOUR_AUDIT_LOGS_R2_BUCKET_NAME"

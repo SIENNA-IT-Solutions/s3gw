@@ -141,16 +141,16 @@ Now, point any S3 tool (AWS CLI, Cyberduck, Veeam, rclone) to `https://s3gw.your
 
 ---
 
-## 🔗 The Bridge to `tamper` — Deep S3 Object Security & FIM
+## 🔗 The Bridge to `tamper` — Our S3 FIM-DSPM-DAM-DLP Solution
 
 S3GW excels at perimeter defense (`North-South traffic interception`) at the network edge. But what happens if:
-- An attacker bypasses the gateway proxy directly to your underlying cloud provider (`East-West` or root credential compromise)?
-- A legitimate access key or application silently corrupts files, uploads poisoned payloads, or modifies critical metadata?
-- You require compliance-grade **File Integrity Monitoring (FIM)**, continuous cryptographic verification (`SHA-256/BLAKE3`), automated threat forensics, and centralized SOC dashboards without building custom SIEM parsers?
+- An attacker bypasses the gateway proxy directly to your underlying cloud provider (`East-West` or root credential compromise) ?
+- A legitimate access key or application silently corrupts files, uploads poisoned payloads, or modifies critical metadata ?
+- You require compliance-grade **File Integrity Monitoring (FIM)**, continuous cryptographic verification, automated threat forensics, and centralized SOC dashboards without building custom SIEM parsers?
 
-👉 **Discover [`tamper`](https://tamper.fr)** — our professional SaaS cybersecurity platform specifically engineered for **S3 Object Storage Data Integrity, File Integrity Monitoring (FIM), and Cloud Detection & Response (CDR)**.
+👉 **Discover [`tamper`](https://tamper.fr)** — our professional SaaS cybersecurity platform specifically engineered for **S3 Object Storage Data Integrity, File Integrity Monitoring (FIM), with DSPM, DAM and DLP features, that can run On-Prem on your Infrastructure !**.
 
-S3GW natively integrates with **tamper**: connect your S3GW audit buckets to tamper to unlock instant visual dashboards, real-time SOC alerts (`Slack / Teams / PagerDuty / Datadog`), and automated deep-object verification across all your clouds.
+S3GW natively integrates with **tamper**: connect your S3GW audit buckets to tamper to unlock instant visual dashboards, real-time SOC alerts (`PagerDuty/Slack/Jira and more`), and automated deep-object verification across all your providers !.
 
 ---
 

@@ -1,5 +1,6 @@
-# S3GW — Universal Cloudflare Edge S3 Firewall & IPS Proxy
+# S3GW — Universal S3 Gateway at the Edge with Logging, Firewall & IPS Proxy capabilities
 
+[![Website](https://img.shields.io/badge/Website-s3gw.com-F0B429?labelColor=171310&style=flat-square)](https://s3gw.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-F0B429?labelColor=171310&style=flat-square)](https://opensource.org/licenses/MIT)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare%20Workers-Ready-F0B429?labelColor=171310&logo=cloudflare&logoColor=171310&style=flat-square)](https://workers.cloudflare.com/)
 [![Built by SIENNA](https://img.shields.io/badge/Built%20by-SIENNA%20IT%20Solutions-F0B429?labelColor=171310&style=flat-square)](https://sienna.dev)

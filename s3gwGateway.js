@@ -1,37 +1,46 @@
 /**
  * ============================================================================
- * S3GW — Universal Cloudflare Edge S3 Firewall & IPS Proxy
- * ============================================================================
- * 
- * An open-source, provider-agnostic, zero-trust S3 reverse-proxy executing at
- * cloud scale on Cloudflare Workers. Intercepts, validates (AWS SigV4), logs,
- * and actively defends S3 buckets across any cloud provider (AWS, R2, Scaleway,
- * Hetzner, OVH, Backblaze B2, Google Cloud Storage, etc.).
- * 
- * Developed by SIENNA IT Solutions (https://sienna.dev)
- * Core Open-Source Perimeter Module for tamper (https://tamper.fr)
- * License: MIT
- * 
- * Key Capabilities:
- *  1. Transparent Proxying & Resigning: 100% S3 API & AWS Signature V4 compliant.
- *  2. Security Policy Engine (IPS/WAF): Geo-blocking, ASN/IP denylists, and
- *     Ransomware Killswitch (.locked, .encrypted, etc. payload blocking).
- *  3. DLP Exfiltration Guard: Sliding volumetric quotas (bytes/hr) and rate limiting
- *     (GET/DELETE requests/min) with automatic ephemeral KV quarantine.
- *  4. Real-Time SIEM Audit Logging: Asynchronous JSON logging (`ctx.waitUntil`)
- *     to Cloudflare R2, ready for Splunk, Datadog, Elastic Security, or Wazuh.
- * 
- * Required Cloudflare Worker Bindings:
- *  - LICENSES_KV : KV Namespace storing client configurations (`s3gwLicence.json`)
- *  - R2_GATEWAY  : R2 Bucket storing enriched JSON audit logs
- *  - GATEWAY_HOST: Environment variable (default: "s3gw.yourdomain.com")
+ * Cloudflare Worker — S3 Gateway Standalone (Audit & Logging)
  * ============================================================================
  *
- * Example JSON Audit Log Stored in Cloudflare R2:
+ * Indications globales :
+ * Ce code est conçu pour s'exécuter en tant que Worker Cloudflare. Il agit comme
+ * une passerelle (reverse-proxy) S3 universelle, vérifie l'authentification AWS
+ * Signature V4, forwarde les requêtes vers le fournisseur de stockage sous-jacent
+ * et enregistre de manière non bloquante les logs d'audit des accès.
+ *
+ * Variables d'environnement requises (Bindings Cloudflare Worker) :
  * ----------------------------------------------------------------------------
- * [Example 1: Allowed PUT Operation (File Upload)]
+ * 1. LICENSES_KV (KV Namespace) :
+ *    Namespace KV contenant les configurations et accès des clients/buckets.
+ *    La clé (key) dans le KV correspond directement à l'Access Key ID utilisée
+ *    par le client S3 lors de ses requêtes vers la gateway.
+ *
+ * 2. R2_GATEWAY (R2 Bucket) :
+ *    Bucket R2 dans lequel seront stockés les logs d'audit générés par le Worker.
+ *    Les fichiers sont enregistrés au format JSON de manière asynchrone.
+ *
+ *    Préfixage et arborescence des logs dans R2 :
+ *    -------------------------------------------------------------------------
+ *    Chaque log est stocké dans un fichier JSON unique et immutable sous le chemin :
+ *    [licenseKey]/YYYY/MM/DD/log[8chars][timestamp].json
+ *
+ *    - [licenseKey] : Clé d'accès utilisée (ex: "DEMO_S3GW_KEY")
+ *    - YYYY/MM/DD   : Date UTC (année/mois/jour) permettant un partionnement optimal
+ *    - [8chars]     : 8 premiers caractères de la licence pour unicité visuelle
+ *    - [timestamp]  : Horodatage millisecondes (epoch)
+ *    Exemple de chemin R2 : DEMO_S3GW_KEY/2026/07/04/logDEMO_S3G1783280000000.json
+ *
+ * 3. GATEWAY_HOST (Variable globale / Environment Variable) :
+ *    Le nom de domaine ou sous-domaine auquel on associe le code (ex: s3.mondomaine.com).
+ *    Important : Il faut également lier ce Worker à ce sous-domaine via un
+ *    Custom Domain ou une Route dans la configuration Cloudflare.
+ *
+ * Exemples de logs JSON enregistrés dans R2 :
+ * ----------------------------------------------------------------------------
+ * [Exemple 1 : Opération PUT (Écriture / Upload de fichier)]
  * {
- *   "ts": "2026-07-11T19:45:12.304Z",
+ *   "ts": "2026-07-04T19:45:12.304Z",
  *   "licence": "DEMO_S3GW_KEY",
  *   "gateway": {
  *     "ip": "81.252.14.99",
@@ -58,40 +67,38 @@
  *     "flags": ["write_operation"]
  *   }
  * }
- * 
- * [Example 2: Blocked / Quarantined Access Attempt]
+ *
+ * [Exemple 2 : Opération GET (Lecture / Téléchargement)]
  * {
- *   "ts": "2026-07-11T19:48:05.892Z",
+ *   "ts": "2026-07-04T19:48:05.892Z",
  *   "licence": "DEMO_S3GW_KEY",
  *   "gateway": {
  *     "ip": "185.220.101.5",
- *     "country": "RU",
- *     "city": "Moscow",
+ *     "country": "DE",
+ *     "city": "Frankfurt",
  *     "asn": "AS24940",
  *     "as_organization": "Hetzner Online GmbH",
- *     "user_agent": "aws-cli/2.15.0 Python/3.11.6 Linux/x86_64",
+ *     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Veeam/12",
  *     "access_key_used": "DEMO_S3GW_KEY"
  *   },
  *   "operation": {
  *     "method": "GET",
  *     "type": "getObject",
  *     "bucket": "my-target-bucket",
- *     "key": "/database/backup_prod.sql"
+ *     "key": "/backup/db_prod_daily.bak"
  *   },
  *   "response": {
- *     "status": 403,
- *     "bytes": 0,
- *     "duration_ms": 14
+ *     "status": 200,
+ *     "bytes": 1073741824,
+ *     "duration_ms": 850
  *   },
  *   "security": {
- *     "action": "blocked",
- *     "risk_level": "high",
- *     "block_reason": "GEO_RESTRICTED",
- *     "flags": ["read_operation", "access_denied", "geo_restricted", "security_policy_blocked"]
+ *     "risk_level": "info",
+ *     "flags": ["read_operation"]
  *   }
  * }
- * 
- * Example KV Client License Object (Key = Access Key ID, e.g., "DEMO_S3GW_KEY"):
+ *
+ * Exemple de JSON nécessaire dans le KV (Clé = Access Key ID, ex: "DEMO_S3GW_KEY") :
  * ----------------------------------------------------------------------------
  * {
  *   "activated": true,
@@ -150,7 +157,7 @@ export default {
 
         const url = new URL(request.url);
         const authHeader = request.headers.get("Authorization") || "";
-        const configuredGatewayHost = (env.GATEWAY_HOST || "s3gw.yourdomain.com").toLowerCase();
+        const configuredGatewayHost = (env.GATEWAY_HOST || "gateway.s3gw.com").toLowerCase();
 
         if (!authHeader.startsWith("AWS4-HMAC-SHA256")) {
             return errorResponse(403, "AccessDenied", "AWS Signature V4 requise.", configuredGatewayHost);
@@ -163,7 +170,7 @@ export default {
         }
 
         const licenseKey = gwAccessKeyReceived;
-        // Optimization: Parallel KV fetch for license object and quarantine status (`0ms sequential latency`)
+        // Optimisation majeure : Get parallèle (licence + état de quarantaine) pour 0 latence séquentielle
         const [license, quarantine] = await Promise.all([
             env.LICENSES_KV.get(licenseKey, { type: "json" }),
             env.LICENSES_KV.get(`quarantine:${licenseKey}`, { type: "json" })
@@ -203,6 +210,16 @@ export default {
             targetPath = `/${vhBucket}${targetPath === '/' ? '' : targetPath}`;
         }
 
+        const pathParts = targetPath.split("/").filter(p => p.length > 0);
+        const requestedBucket = pathParts.length > 0 ? pathParts[0] : "";
+
+        if (requestedBucket && requestedBucket !== license.bucket) {
+            return errorResponse(403, "AccessDenied", "Access to this bucket is not allowed by your license.", configuredGatewayHost);
+        }
+        if (!requestedBucket && license.bucket) {
+            return errorResponse(403, "AccessDenied", "Listing all buckets is not allowed. Please specify your bucket.", configuredGatewayHost);
+        }
+
         const method = request.method;
         const path = targetPath;
         const queryString = url.search;
@@ -217,7 +234,7 @@ export default {
 
         const startMs = Date.now();
 
-        // 1. DLP Exfiltration Guard Check: Immediate blocking if access key is currently quarantined
+        // --- PILIER 2 : DLP QUARANTAINE CHECK (Vérification immédiate sans surcoût KV) ---
         if (quarantine) {
             const durationMs = Date.now() - startMs;
             const logEntry = buildLogEntry({
@@ -250,7 +267,7 @@ export default {
             return errorResponse(429, "SlowDown", `S3GW Exfiltration Guard: Access key is quarantined (${quarantine.reason || "Quota exceeded"}). Try again later.`, configuredGatewayHost);
         }
 
-        // 2. Security Policy Engine (IPS/WAF Inline Check: Geo, ASN, IP, Ransomware Killswitch)
+        // --- PILIER 1 : SECURITY POLICY ENGINE (IPS / WAF S3 Inline) ---
         const secDecision = checkSecurityPolicy(request, url, targetPath, license, s3Operation, sourceIP, country, asn);
         if (!secDecision.allowed) {
             const durationMs = Date.now() - startMs;
@@ -286,7 +303,7 @@ export default {
         const respBytes = parseInt(backendResp.headers.get("Content-Length") || "0", 10);
         const actualBytes = (method === "GET" || s3Operation === "getObject") ? respBytes : contentLength;
 
-        // 3. Asynchronous DLP Tracking (`ctx.waitUntil`): Track volumetric quotas & rates without blocking client
+        // --- PILIER 2 : DLP QUOTAS & QUARANTAINE (Asynchrone non-bloquant via ctx.waitUntil) ---
         if (backendResp.ok || backendResp.status === 304) {
             ctx.waitUntil(trackDlpQuotasAndQuarantine(env, licenseKey, license, method, s3Operation, actualBytes));
         }
@@ -623,7 +640,9 @@ async function forwardToBackend(request, originalUrl, targetPath, license, env) 
 function decideShouldLog(method, s3Operation, contentLength) {
     if (!LOGGABLE_METHODS.has(method)) return false;
 
-    if (method === "GET" && s3Operation !== "getObject") return false;
+    // We log all GET operations (getObject, listObjects, etc.)
+    // HEAD is already excluded by LOGGABLE_METHODS
+    // if (method === "GET" && s3Operation !== "getObject") return false;
 
     if (method === "POST" && !LOGGABLE_POST_ACTIONS.has(s3Operation)) return false;
 
@@ -687,14 +706,13 @@ function resolveS3Operation(method, path, queryString) {
 }
 
 // ============================================================
-// ============================================================================
-// SECURITY POLICY ENGINE (Inline IPS / WAF check)
-// ============================================================================
+// PILIER 1 : MOTEUR DE SÉCURITÉ & INTERCEPTION S3GW (IPS/WAF)
+// ============================================================
 
 function checkSecurityPolicy(request, url, targetPath, license, s3Operation, sourceIP, country, asn) {
     const sec = license.security_policy || license.securityPolicy || {};
 
-    // 1. IP Denylist and Allowlist Filtering
+    // 1. Filtrage par liste noire / blanche d'IP
     const blockedIps = sec.blocked_ips || sec.blockedIps || [];
     if (blockedIps.includes(sourceIP)) {
         return {
@@ -719,7 +737,7 @@ function checkSecurityPolicy(request, url, targetPath, license, s3Operation, sou
         };
     }
 
-    // 2. Geographic Filtering (Country origin check via Cloudflare Edge)
+    // 2. Filtrage Géographique (Pays d'origine via Cloudflare Edge)
     const blockedCountries = sec.blocked_countries || sec.blockedCountries || [];
     if (country !== "Unknown" && blockedCountries.map(c => String(c).toUpperCase()).includes(String(country).toUpperCase())) {
         return {
@@ -744,7 +762,7 @@ function checkSecurityPolicy(request, url, targetPath, license, s3Operation, sou
         };
     }
 
-    // 3. ASN / ISP Reputation Filtering (Drop suspicious ASNs or TOR exit nodes)
+    // 3. Filtrage ASN / ISP (ex: blocage hébergeurs suspects / nœuds TOR)
     const blockedAsns = sec.blocked_asns || sec.blockedAsns || [];
     const numAsn = typeof asn === "number" ? asn : parseInt(String(asn).replace("AS", ""), 10);
     if (!isNaN(numAsn) && blockedAsns.includes(numAsn)) {
@@ -794,13 +812,22 @@ function checkSecurityPolicy(request, url, targetPath, license, s3Operation, sou
     // 5. Ransomware Killswitch & Extension Filtering sur écritures
     const RANSOMWARE_EXTENSIONS = [
         ".locked", ".encrypted", ".ransom", ".crypt", ".lock", ".wannacry",
-        ".lockbit", ".crptr", ".crypto", ".enc", ".rnsm"
+        ".lockbit", ".crptr", ".crypto", ".enc", ".rnsm", ".cerber", ".locky", 
+        ".cryptowall", ".zepto", ".odin", ".thor", ".ryuk", ".phobos", ".dharma", 
+        ".globeimposter", ".makop", ".medusa", ".qilin", ".akira", ".blackcat", 
+        ".clop", ".conti", ".darkside", ".doppelpaymer", ".maze", ".netwalker", 
+        ".petya", ".revil", ".sodinokibi", ".snatch", ".stop", ".djvu", ".harma", 
+        ".arena", ".cesar", ".crab", ".krab", ".gandcrab", ".vault", ".xtbl", 
+        ".yta", ".abc", ".ccc", ".vvv", ".micro", ".magic", ".exx", ".ezz", ".ecc"
     ];
+
+    const customBlockedExts = sec.custom_blocked_extensions || sec.customBlockedExtensions || [];
+    const allBlockedExts = [...RANSOMWARE_EXTENSIONS, ...customBlockedExts].map(ext => ext.toLowerCase().startsWith('.') ? ext.toLowerCase() : '.' + ext.toLowerCase());
 
     const isPutMutation = ["putObject", "copyObject", "postObject", "uploadPart"].includes(s3Operation);
     if (isPutMutation) {
         const lowerPath = targetPath.toLowerCase();
-        for (const ext of RANSOMWARE_EXTENSIONS) {
+        for (const ext of allBlockedExts) {
             if (lowerPath.endsWith(ext) || lowerPath.includes(ext + ".")) {
                 const killswitchActive = sec.ransomware_killswitch !== false; // Activé par défaut
                 if (killswitchActive) {
@@ -820,9 +847,9 @@ function checkSecurityPolicy(request, url, targetPath, license, s3Operation, sou
     return { allowed: true };
 }
 
-// ============================================================================
-// DLP QUOTAS & QUARANTINE TRACKER (100% KV + Automatic Expiration TTL)
-// ============================================================================
+// ============================================================
+// PILIER 2 : DLP QUOTAS GLISSANTS & QUARANTAINE (100% KV + TTL)
+// ============================================================
 
 async function trackDlpQuotasAndQuarantine(env, licenseKey, license, method, s3Operation, actualBytes) {
     try {
@@ -837,7 +864,7 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, license, method, s3O
 
         const quarantineDuration = quotas.quarantine_duration_seconds || 3600;
 
-        // 1. Download Volumetric Exfiltration Quota (Bytes per hour)
+        // 1. Quota d'exfiltration en téléchargement (Bytes per hour)
         if ((method === "GET" || s3Operation === "getObject") && actualBytes > 0 && quotas.max_download_bytes_per_hour) {
             const hourKey = `dlp:${licenseKey}:bytes:${ymd}-${hour}`;
             const currentStr = await env.LICENSES_KV.get(hourKey);
@@ -856,7 +883,7 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, license, method, s3O
             }
         }
 
-        // 2. GET Request Rate Quota per Minute (Anti-scraping / bulk scan protection)
+        // 2. Quota de requêtes GET par minute (Anti-aspiration / scan)
         if ((method === "GET" || s3Operation === "getObject" || s3Operation === "listObjects") && quotas.max_get_requests_per_minute) {
             const minKey = `dlp:${licenseKey}:get:${ymd}-${hour}-${minute}`;
             const currentStr = await env.LICENSES_KV.get(minKey);
@@ -875,7 +902,7 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, license, method, s3O
             }
         }
 
-        // 3. DELETE Request Rate Quota per Minute (Anti-wiper / mass destruction protection)
+        // 3. Quota de requêtes DELETE par minute (Anti-wiper / destruction de masse)
         if ((method === "DELETE" || s3Operation.includes("delete")) && quotas.max_delete_requests_per_minute) {
             const minKey = `dlp:${licenseKey}:del:${ymd}-${hour}-${minute}`;
             const currentStr = await env.LICENSES_KV.get(minKey);
@@ -932,7 +959,7 @@ function buildLogEntry({ licenseKey, gwHost, sourceIP, country, city, asn, asOrg
         ts: new Date().toISOString(),
         licence: licenseKey,
         gateway: {
-            host: gwHost || "s3gw.yourdomain.com",
+            host: gwHost || "gateway.s3gw.com",
             ip: sourceIP,
             country,
             city,
@@ -991,7 +1018,7 @@ function uriEncode(str) {
     });
 }
 
-function errorResponse(status, code, message, gwHost = "s3gw.yourdomain.com") {
+function errorResponse(status, code, message, gwHost = "gateway.s3gw.com") {
     const reqId = "s3gw-" + Math.random().toString(36).substring(2, 11);
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Error>

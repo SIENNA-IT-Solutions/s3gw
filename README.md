@@ -1,9 +1,9 @@
 # S3GW — Universal Cloudflare Edge S3 Firewall & IPS Proxy
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare%20Workers-Ready-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
-[![Built by SIENNA](https://img.shields.io/badge/Built%20by-SIENNA%20IT%20Solutions-00F2FE.svg)](https://sienna.dev)
-[![tamper Module](https://img.shields.io/badge/Core%20Module%20for-tamper-8A2BE2.svg)](https://tamper.fr)
+[![License: MIT](https://img.shields.io/badge/License-MIT-F0B429?labelColor=171310&style=flat-square)](https://opensource.org/licenses/MIT)
+[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare%20Workers-Ready-F0B429?labelColor=171310&logo=cloudflare&logoColor=171310&style=flat-square)](https://workers.cloudflare.com/)
+[![Built by SIENNA](https://img.shields.io/badge/Built%20by-SIENNA%20IT%20Solutions-F0B429?labelColor=171310&style=flat-square)](https://sienna.dev)
+[![tamper Module](https://img.shields.io/badge/Core%20Module%20for-tamper-F0B429?labelColor=171310&style=flat-square)](https://tamper.fr)
 
 **S3GW** is an open-source, provider-agnostic **Cybersecurity Reverse-Proxy and Active Threat Firewall for the S3 protocol**. Executing with **0ms sequential overhead** on Cloudflare Workers (Anycast Edge across 300+ global cities), S3GW sits transparently between your applications/backup agents and your real object storage provider.
 
@@ -11,7 +11,7 @@ Whether your buckets are hosted on **AWS S3, Cloudflare R2, Scaleway, Hetzner, O
 
 ---
 
-## 🚀 Why S3GW?
+## Why S3GW?
 
 Legacy S3 buckets are vulnerable to **stolen access keys**, **overnight data exfiltration**, **ransomware encryption**, and **mass deletion (wipers)**. Native IAM policies are complex, provider-dependent, and lack instant edge geo-blocking or volumetric rate limits.
 
@@ -22,13 +22,14 @@ S3GW solves this by introducing **IAM Virtualization & Perimeter Defense**:
 
 ---
 
-## 🛡️ Key Features & The 2 Pillars of Active Cyber Defense
+## Key Features & The 2 Pillars of Active Cyber Defense
 
 ### Pillar 1: Active Threat Blocking & Security Policy Engine (Inline IPS/WAF)
 Every access key can be hardened with precise behavioral restrictions:
+- **Strict Target Bucket Validation:** Every request is tightly validated against the exact bucket authorized in the KV license. Any mismatch or global listing attempt triggers an instant 403.
 - **Geo-Blocking & ASN Reputation:** Whitelist/Denylist specific countries (`allowed_countries`, `blocked_countries`), ISPs, or Autonomous Systems (`blocked_asns`).
 - **IP Denylists / Whitelists:** Instantly drop traffic from suspicious or unauthorized IP ranges.
-- **Ransomware Extension Killswitch (`PUT` Inspection):** Automatically detects and drops file uploads with known ransomware extensions (`.locked`, `.encrypted`, `.ransom`, `.lock`, `.crypt`). Returns official S3 XML `403 AccessDenied`.
+- **Ransomware Extension Killswitch (`PUT` Inspection):** Automatically detects and drops file uploads with known ransomware extensions. Now built-in with over 50 of the most active ransomware extensions (LockBit, Conti, BlackCat, Akira, Phobos, etc.) and supports custom extension blocklists per license.
 - **Administrative Operation Prohibition:** Block bucket-destroying or security-disabling operations (`deleteBucket`, `putBucketVersioning` suspended, `putBucketLifecycle` deletion) even if the underlying cloud API key has admin privileges (`allow_admin_operations: false`).
 
 ### Pillar 2: Data Exfiltration Prevention (DLP Volumetric Quotas & Auto-Quarantine)
@@ -39,9 +40,9 @@ Defend against stolen logic access keys being used to download entire data lakes
 
 ---
 
-## 📊 Enriched SIEM JSON Audit Logging (`V2 Specification`)
+## Enriched SIEM JSON Audit Logging (`V2 Specification`)
 
-Every single request—whether allowed, geo-blocked, or quarantined—is asynchronously recorded as an immutable JSON audit file into a Cloudflare R2 bucket (`R2_GATEWAY`).
+Every single request—whether allowed, geo-blocked, or quarantined—is asynchronously recorded as an immutable JSON audit file into a Cloudflare R2 bucket (`R2_GATEWAY`). To ensure a high signal-to-noise ratio, all critical actions and data access (`GET`, `PUT`, `DELETE`, listings) are fully logged, while passive metadata reads (`HEAD`) are intentionally ignored to prevent noise.
 
 ### Directory Partitioning Structure in R2:
 ```text
@@ -85,7 +86,7 @@ Every single request—whether allowed, geo-blocked, or quarantined—is asynchr
 
 ---
 
-## ⚡ 5-Minute Deployment Guide on Cloudflare Workers
+## 5-Minute Deployment Guide on Cloudflare Workers
 
 ### 1. Prerequisites
 - A Cloudflare account with Workers, KV, and R2 enabled.
@@ -141,29 +142,29 @@ Now, point any S3 tool (AWS CLI, Cyberduck, Veeam, rclone) to `https://s3gw.your
 
 ---
 
-## 🔗 The Bridge to `tamper` — Our S3 FIM-DSPM-DAM-DLP Solution
+## The Bridge to tamper — Deep S3 Object Security & FIM
 
 S3GW excels at perimeter defense (`North-South traffic interception`) at the network edge. But what happens if:
-- An attacker bypasses the gateway proxy directly to your underlying cloud provider (`East-West` or root credential compromise) ?
-- A legitimate access key or application silently corrupts files, uploads poisoned payloads, or modifies critical metadata ?
-- You require compliance-grade **File Integrity Monitoring (FIM)**, continuous cryptographic verification, automated threat forensics, and centralized SOC dashboards without building custom SIEM parsers?
+- An attacker bypasses the gateway proxy directly to your underlying cloud provider (`East-West` or root credential compromise)?
+- A legitimate access key or application silently corrupts files, uploads poisoned payloads, or modifies critical metadata?
+- You require compliance-grade **File Integrity Monitoring (FIM)**, continuous cryptographic verification (`SHA-256/BLAKE3`), automated threat forensics, and centralized SOC dashboards without building custom SIEM parsers?
 
-👉 **Discover [`tamper`](https://tamper.fr)** — our professional SaaS cybersecurity platform specifically engineered for **S3 Object Storage Data Integrity, File Integrity Monitoring (FIM), with DSPM, DAM and DLP features, that can run On-Prem on your Infrastructure !**.
+**Discover [tamper](https://tamper.fr)** — our professional SaaS cybersecurity platform specifically engineered for **S3 Object Storage Data Integrity, File Integrity Monitoring (FIM), and Cloud Detection & Response (CDR)**.
 
-S3GW natively integrates with **tamper**: connect your S3GW audit buckets to tamper to unlock instant visual dashboards, real-time SOC alerts (`PagerDuty/Slack/Jira and more`), and automated deep-object verification across all your providers !.
+S3GW natively integrates with **tamper**: connect your S3GW audit buckets to tamper to unlock instant visual dashboards, real-time SOC alerts (`Slack / Teams / PagerDuty / Datadog`), and automated deep-object verification across all your clouds.
 
 ---
 
-## ⭐ Contributing & Open-Source Community
+## Contributing & Open-Source Community
 
 We love open-source! If you find **S3GW** useful:
-1. **⭐ Star this repository** to support our research in open-source cloud security.
+1. **Star this repository** to support our research in open-source cloud security.
 2. **Fork & Build:** Feel free to create your own implementation or port the S3GW logic to your favorite language (**Go, Rust, Python, TypeScript**).
 3. **Submit PRs:** Found a bug, want to add new DLP detection rules or webhook exporters? Pull requests are warmly welcomed!
 
 ---
 
-## 📄 License & Credits
+## License & Credits
 
-Developed with ❤️ by **[SIENNA](https://sienna.dev)** (`tamper` team).  
+Developed by **[SIENNA](https://sienna.dev)** (`tamper` team).  
 Released under the **[MIT License](./LICENSE)**. Free to use, modify, and distribute for commercial and private projects.

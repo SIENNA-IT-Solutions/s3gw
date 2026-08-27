@@ -268,7 +268,7 @@ export default {
         }
 
         // --- PILIER 1 : SECURITY POLICY ENGINE (IPS / WAF S3 Inline) ---
-        const secDecision = checkSecurityPolicy(request, url, targetPath, license, s3Operation, sourceIP, country, asn);
+        const secDecision = checkSecurityPolicy(request, url, targetPath, license, s3Operation, sourceIP, country, asn, userAgent);
         if (!secDecision.allowed) {
             const durationMs = Date.now() - startMs;
             const logEntry = buildLogEntry({
@@ -709,8 +709,33 @@ function resolveS3Operation(method, path, queryString) {
 // PILIER 1 : MOTEUR DE SÉCURITÉ & INTERCEPTION S3GW (IPS/WAF)
 // ============================================================
 
-function checkSecurityPolicy(request, url, targetPath, license, s3Operation, sourceIP, country, asn) {
+function checkSecurityPolicy(request, url, targetPath, license, s3Operation, sourceIP, country, asn, userAgent) {
     const sec = license.security_policy || license.securityPolicy || {};
+
+    // 0. Filtrage par User-Agent
+    const blockedUA = sec.blocked_user_agents || sec.blockedUserAgents || [];
+    if (userAgent && blockedUA.some(ua => userAgent.toLowerCase().includes(String(ua).toLowerCase()))) {
+        return {
+            allowed: false,
+            status: 403,
+            code: "AccessDenied",
+            message: "Access blocked by S3GW Security Policy (User-Agent in denylist).",
+            blockReason: "USER_AGENT_DENYLIST",
+            riskLevel: "high"
+        };
+    }
+
+    const allowedUA = sec.allowed_user_agents || sec.allowedUserAgents || [];
+    if (allowedUA.length > 0 && userAgent && !allowedUA.some(ua => userAgent.toLowerCase().includes(String(ua).toLowerCase()))) {
+        return {
+            allowed: false,
+            status: 403,
+            code: "AccessDenied",
+            message: "Access blocked by S3GW Security Policy (User-Agent not in allowlist).",
+            blockReason: "USER_AGENT_NOT_ALLOWED",
+            riskLevel: "high"
+        };
+    }
 
     // 1. Filtrage par liste noire / blanche d'IP
     const blockedIps = sec.blocked_ips || sec.blockedIps || [];

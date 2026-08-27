@@ -1,7 +1,7 @@
-# S3GW — Universal S3 Gateway at the Edge with Logging, Firewall & IPS Proxy capabilities
+# S3GW — Universal Cloudflare Edge S3 Firewall & IPS Proxy
 
 [![Website](https://img.shields.io/badge/Website-s3gw.com-F0B429?labelColor=171310&style=flat-square)](https://s3gw.com)
-[![License: MIT](https://img.shields.io/badge/License-MIT-F0B429?labelColor=171310&style=flat-square)](https://opensource.org/licenses/MIT)
+[![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-F0B429?labelColor=171310&style=flat-square)](./LICENSE)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare%20Workers-Ready-F0B429?labelColor=171310&logo=cloudflare&logoColor=171310&style=flat-square)](https://workers.cloudflare.com/)
 [![Built by SIENNA](https://img.shields.io/badge/Built%20by-SIENNA%20IT%20Solutions-F0B429?labelColor=171310&style=flat-square)](https://sienna.dev)
 [![tamper Module](https://img.shields.io/badge/Core%20Module%20for-tamper-F0B429?labelColor=171310&style=flat-square)](https://tamper.fr)
@@ -103,7 +103,7 @@ wrangler kv namespace create LICENSES_KV
 wrangler r2 bucket create s3gw-audit-logs
 ```
 
-Then, clone this MIT repository and configure your bindings:
+Then, clone this repository and configure your bindings:
 ```bash
 git clone https://github.com/SIENNA-IT-Solutions/s3gw.git
 cd s3gw
@@ -168,4 +168,4 @@ We love open-source! If you find **S3GW** useful:
 ## License & Credits
 
 Developed by **[SIENNA](https://sienna.dev)** (`tamper` team).  
-Released under the **[MIT License](./LICENSE)**. Free to use, modify, and distribute for commercial and private projects.
+Released under the **[Business Source License 1.1 (BSL)](./LICENSE)**. Free to use and modify for internal infrastructure, but cannot be offered as a competing commercial SaaS.

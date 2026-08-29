@@ -143,6 +143,23 @@ const LOGGABLE_POST_ACTIONS = new Set([
     "deleteObjects",
 ]);
 
+// Cache mémoire global pour réduire les appels KV (coût & latence)
+const kvCache = new Map();
+const CACHE_TTL_MS = 60000; // 60 secondes
+
+async function getCachedKV(env, key) {
+    const now = Date.now();
+    if (kvCache.has(key)) {
+        const cached = kvCache.get(key);
+        if (now - cached.timestamp < CACHE_TTL_MS) {
+            return cached.data;
+        }
+    }
+    const data = await env.LICENSES_KV.get(key, { type: "json" });
+    kvCache.set(key, { data, timestamp: now });
+    return data;
+}
+
 export default {
     async fetch(request, env, ctx) {
         if (request.method === "OPTIONS") {
@@ -170,10 +187,11 @@ export default {
         }
 
         const licenseKey = gwAccessKeyReceived;
-        // Optimisation majeure : Get parallèle (licence + état de quarantaine) pour 0 latence séquentielle
+        
+        // Optimisation majeure : Cache mémoire global + Get parallèle pour 0 coût et 0 latence séquentielle
         const [license, quarantine] = await Promise.all([
-            env.LICENSES_KV.get(licenseKey, { type: "json" }),
-            env.LICENSES_KV.get(`quarantine:${licenseKey}`, { type: "json" })
+            getCachedKV(env, licenseKey),
+            getCachedKV(env, `quarantine:${licenseKey}`)
         ]);
 
         if (!license) {

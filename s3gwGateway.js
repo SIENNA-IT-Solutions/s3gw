@@ -187,7 +187,7 @@ export default {
         }
 
         const licenseKey = gwAccessKeyReceived;
-        
+
         // Optimisation majeure : Cache mémoire global + Get parallèle pour 0 coût et 0 latence séquentielle
         const [license, quarantine] = await Promise.all([
             getCachedKV(env, licenseKey),
@@ -672,9 +672,9 @@ function resolveS3Operation(method, path, queryString) {
 
     if (method === "GET") {
         const segments = path.split("/").filter(Boolean);
-        if (params.has("list-type") || params.has("delimiter") || params.has("prefix") || segments.length <= 1) return "listObjects";
-        if (params.has("tagging")) return "getObjectTagging";
-        if (params.has("acl")) return "getObjectAcl";
+        const isObject = segments.length > 1;
+        if (params.has("tagging")) return isObject ? "getObjectTagging" : "getBucketTagging";
+        if (params.has("acl")) return isObject ? "getObjectAcl" : "getBucketAcl";
         if (params.has("versioning")) return "getBucketVersioning";
         if (params.has("lifecycle")) return "getBucketLifecycle";
         if (params.has("policy")) return "getBucketPolicy";
@@ -682,23 +682,37 @@ function resolveS3Operation(method, path, queryString) {
         if (params.has("website")) return "getBucketWebsite";
         if (params.has("replication")) return "getBucketReplication";
         if (params.has("object-lock")) return "getObjectLockConfiguration";
+        if (params.has("logging")) return "getBucketLogging";
+        if (params.has("encryption")) return "getBucketEncryption";
+        if (params.has("notification")) return "getBucketNotification";
+        if (params.has("publicAccessBlock")) return "getPublicAccessBlock";
+        if (params.has("ownershipControls")) return "getOwnershipControls";
+        
+        if (params.has("list-type") || params.has("delimiter") || params.has("prefix") || segments.length <= 1) return "listObjects";
         return "getObject";
     }
 
     if (method === "DELETE") {
+        const segments = path.split("/").filter(Boolean);
+        const isObject = segments.length > 1;
         if (params.has("uploadId")) return "abortMultipartUpload";
-        if (params.has("tagging")) return "deleteObjectTagging";
+        if (params.has("tagging")) return isObject ? "deleteObjectTagging" : "deleteBucketTagging";
         if (params.has("lifecycle")) return "deleteBucketLifecycle";
         if (params.has("policy")) return "deleteBucketPolicy";
         if (params.has("cors")) return "deleteBucketCors";
         if (params.has("website")) return "deleteBucketWebsite";
         if (params.has("replication")) return "deleteBucketReplication";
-        return path.split("/").length > 2 ? "deleteObject" : "deleteBucket";
+        if (params.has("encryption")) return "deleteBucketEncryption";
+        if (params.has("publicAccessBlock")) return "deletePublicAccessBlock";
+        if (params.has("ownershipControls")) return "deleteOwnershipControls";
+        return isObject ? "deleteObject" : "deleteBucket";
     }
 
     if (method === "PUT") {
-        if (params.has("tagging")) return "putObjectTagging";
-        if (params.has("acl")) return path.split("/").length > 2 ? "putObjectAcl" : "putBucketAcl";
+        const segments = path.split("/").filter(Boolean);
+        const isObject = segments.length > 1;
+        if (params.has("tagging")) return isObject ? "putObjectTagging" : "putBucketTagging";
+        if (params.has("acl")) return isObject ? "putObjectAcl" : "putBucketAcl";
         if (params.has("versioning")) return "putBucketVersioning";
         if (params.has("lifecycle")) return "putBucketLifecycle";
         if (params.has("policy")) return "putBucketPolicy";
@@ -707,6 +721,10 @@ function resolveS3Operation(method, path, queryString) {
         if (params.has("replication")) return "putBucketReplication";
         if (params.has("object-lock")) return "putObjectLockConfiguration";
         if (params.has("encryption")) return "putBucketEncryption";
+        if (params.has("logging")) return "putBucketLogging";
+        if (params.has("notification")) return "putBucketNotification";
+        if (params.has("publicAccessBlock")) return "putPublicAccessBlock";
+        if (params.has("ownershipControls")) return "putOwnershipControls";
         if (params.has("uploadId")) return "uploadPart";
         if (params.has("copySource") || params.get("x-amz-copy-source")) return "copyObject";
         return "putObject";
@@ -835,7 +853,16 @@ function checkSecurityPolicy(request, url, targetPath, license, s3Operation, sou
         "deleteBucketCors",
         "putBucketWebsite",
         "deleteBucketWebsite",
-        "putBucketEncryption"
+        "putBucketEncryption",
+        "deleteBucketEncryption",
+        "putBucketLogging",
+        "putBucketNotification",
+        "putPublicAccessBlock",
+        "deletePublicAccessBlock",
+        "putOwnershipControls",
+        "deleteOwnershipControls",
+        "putBucketTagging",
+        "deleteBucketTagging"
     ]);
 
     const allowAdmin = sec.allow_admin_operations !== undefined ? sec.allow_admin_operations :
@@ -855,12 +882,12 @@ function checkSecurityPolicy(request, url, targetPath, license, s3Operation, sou
     // 5. Ransomware Killswitch & Extension Filtering sur écritures
     const RANSOMWARE_EXTENSIONS = [
         ".locked", ".encrypted", ".ransom", ".crypt", ".lock", ".wannacry",
-        ".lockbit", ".crptr", ".crypto", ".enc", ".rnsm", ".cerber", ".locky", 
-        ".cryptowall", ".zepto", ".odin", ".thor", ".ryuk", ".phobos", ".dharma", 
-        ".globeimposter", ".makop", ".medusa", ".qilin", ".akira", ".blackcat", 
-        ".clop", ".conti", ".darkside", ".doppelpaymer", ".maze", ".netwalker", 
-        ".petya", ".revil", ".sodinokibi", ".snatch", ".stop", ".djvu", ".harma", 
-        ".arena", ".cesar", ".crab", ".krab", ".gandcrab", ".vault", ".xtbl", 
+        ".lockbit", ".crptr", ".crypto", ".enc", ".rnsm", ".cerber", ".locky",
+        ".cryptowall", ".zepto", ".odin", ".thor", ".ryuk", ".phobos", ".dharma",
+        ".globeimposter", ".makop", ".medusa", ".qilin", ".akira", ".blackcat",
+        ".clop", ".conti", ".darkside", ".doppelpaymer", ".maze", ".netwalker",
+        ".petya", ".revil", ".sodinokibi", ".snatch", ".stop", ".djvu", ".harma",
+        ".arena", ".cesar", ".crab", ".krab", ".gandcrab", ".vault", ".xtbl",
         ".yta", ".abc", ".ccc", ".vvv", ".micro", ".magic", ".exx", ".ezz", ".ecc"
     ];
 
@@ -975,18 +1002,28 @@ function buildLogEntry({ licenseKey, gwHost, sourceIP, country, city, asn, asOrg
     if (["deleteObject", "deleteObjects", "deleteBucket"].includes(s3Operation)) flags.push("delete_operation");
     if (["putObject", "copyObject", "uploadPart", "postObject"].includes(s3Operation)) flags.push("write_operation");
     if (s3Operation === "getObject") flags.push("read_operation");
-    if (s3Operation === "putObjectTagging") flags.push("tagging_change");
-    if (s3Operation.includes("Lifecycle") || s3Operation.includes("Versioning") || s3Operation.includes("ObjectLock")) flags.push("lifecycle_change");
+    
+    const ADMIN_KEYWORDS = ["Versioning", "Lifecycle", "Policy", "Cors", "Website", "Replication", "ObjectLock", "Encryption", "Logging", "Notification", "PublicAccess", "Ownership", "Acl"];
+    if (ADMIN_KEYWORDS.some(kw => s3Operation.includes(kw)) || s3Operation.includes("BucketTagging")) {
+        flags.push("admin_operation");
+    }
+    if (s3Operation.includes("Tagging")) flags.push("tagging_change");
+    
     if (status >= 400) flags.push("error_response");
     if (status === 403) flags.push("access_denied");
     if (status === 429) flags.push("dlp_quarantine_blocked");
 
     let action = "allowed";
     let blockReason = null;
-    let riskLevel =
-        flags.includes("delete_operation") ? "high" :
-            flags.includes("write_operation") ? "medium" :
-                flags.includes("error_response") ? "low" : "info";
+    let riskLevel = "info";
+
+    if (flags.includes("delete_operation")) riskLevel = "high";
+    else if (flags.includes("admin_operation")) {
+        riskLevel = (method === "GET" || method === "HEAD") ? "low" : "high";
+    }
+    else if (flags.includes("write_operation")) riskLevel = "medium";
+    
+    if (status >= 400 && riskLevel === "info") riskLevel = "low";
 
     if (securityDecision && !securityDecision.allowed) {
         action = "blocked";

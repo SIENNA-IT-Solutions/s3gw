@@ -36,6 +36,12 @@
  *    Important : Il faut également lier ce Worker à ce sous-domaine via un
  *    Custom Domain ou une Route dans la configuration Cloudflare.
  *
+ * 4. DISABLE_DLP_KV_WRITES (Variable globale / Environment Variable) :
+ *    Optionnelle. Si définie à "true", la passerelle passe en mode "Audit Only" pour le DLP.
+ *    Elle n'effectuera plus d'écritures KV (très coûteuses) pour suivre les quotas en
+ *    temps réel (bytes par heure, reqs par minute). À utiliser si le calcul du DLP est
+ *    déporté sur un backend asynchrone (comme le fait Tamper).
+ *
  * Exemples de logs JSON enregistrés dans R2 :
  * ----------------------------------------------------------------------------
  * [Exemple 1 : Opération PUT (Écriture / Upload de fichier)]
@@ -322,7 +328,8 @@ export default {
         const actualBytes = (method === "GET" || s3Operation === "getObject") ? respBytes : contentLength;
 
         // --- PILIER 2 : DLP QUOTAS & QUARANTAINE (Asynchrone non-bloquant via ctx.waitUntil) ---
-        if (backendResp.ok || backendResp.status === 304) {
+        const disableDlpKv = env.DISABLE_DLP_KV_WRITES === "true" || env.DISABLE_DLP_KV_WRITES === true || license.disable_dlp_kv_writes === true;
+        if (!disableDlpKv && (backendResp.ok || backendResp.status === 304)) {
             ctx.waitUntil(trackDlpQuotasAndQuarantine(env, licenseKey, license, method, s3Operation, actualBytes));
         }
 
@@ -345,6 +352,7 @@ export default {
                 contentLength: actualBytes,
                 status: backendResp.status,
                 durationMs,
+                securityDecision: undefined
             });
 
             ctx.waitUntil(writeLog(env, licenseKey, logEntry));
@@ -736,6 +744,16 @@ function resolveS3Operation(method, path, queryString) {
         if (params.has("uploads")) return "createMultipartUpload";
         if (params.has("uploadId")) return "completeMultipartUpload";
         return "postObject";
+    }
+
+    if (method === "HEAD") {
+        const segments = path.split("/").filter(Boolean);
+        return segments.length > 1 ? "headObject" : "headBucket";
+    }
+
+    if (method === "OPTIONS") {
+        const segments = path.split("/").filter(Boolean);
+        return segments.length > 1 ? "optionsObject" : "optionsBucket";
     }
 
     return `${method.toLowerCase()}Unknown`;

@@ -118,6 +118,7 @@ compatibility_date = "2026-07-11"
 
 [vars]
 GATEWAY_HOST = "s3gw.yourdomain.com" # Or your Cloudflare Worker domain (e.g. s3gw.my-tenant.workers.dev)
+# DISABLE_DLP_KV_WRITES = "true" # Optional: Set to true to disable real-time DLP quota tracking (KV writes) for "Audit Only" mode.
 
 [[kv_namespaces]]
 binding = "LICENSES_KV"
@@ -127,6 +128,10 @@ id = "YOUR_CLOUDFLARE_KV_NAMESPACE_ID"
 binding = "R2_GATEWAY"
 bucket_name = "s3gw-audit-logs"
 ```
+
+> [!TIP]
+> **Audit-Only Mode (Save KV Costs)**
+> If you process DLP exfiltration quotas asynchronously in your backend SIEM (or via Tamper), you can add `DISABLE_DLP_KV_WRITES = "true"` to your `[vars]`. This will instruct the gateway to skip all quota KV write operations, saving significant Cloudflare KV write costs. The WAF/IPS blocking (Killswitch, IP/Geo-blocking) remains fully active.
 
 ### 3. Deploy to Cloudflare Edge
 ```bash

@@ -592,11 +592,8 @@ async function forwardToBackend(request, originalUrl, targetPath, license, env) 
         bodyToForward = bodyToForward.pipeThrough(createAwsChunkedDecoderStream());
     }
 
-    if (bodyToForward !== null) {
-        const bodyBuffer = await new Response(bodyToForward).arrayBuffer();
-        cleanHeaders.set("Content-Length", bodyBuffer.byteLength.toString());
-        bodyToForward = bodyBuffer;
-    }
+    // Le stream (bodyToForward) est conservé intact pour un transfert au fil de l'eau.
+    // Le Content-Length est déjà correctement défini dans cleanHeaders.
 
     cleanHeaders.set("X-Amz-Content-Sha256", actualPayloadHash);
 
@@ -697,7 +694,7 @@ function resolveS3Operation(method, path, queryString) {
         if (params.has("notification")) return "getBucketNotification";
         if (params.has("publicAccessBlock")) return "getPublicAccessBlock";
         if (params.has("ownershipControls")) return "getOwnershipControls";
-        
+
         if (params.has("list-type") || params.has("delimiter") || params.has("prefix") || segments.length <= 1) return "listObjects";
         return "getObject";
     }
@@ -1022,13 +1019,13 @@ function buildLogEntry({ licenseKey, gwHost, sourceIP, country, city, asn, asOrg
     if (["deleteObject", "deleteObjects", "deleteBucket"].includes(s3Operation)) flags.push("delete_operation");
     if (["putObject", "copyObject", "uploadPart", "postObject"].includes(s3Operation)) flags.push("write_operation");
     if (s3Operation === "getObject") flags.push("read_operation");
-    
+
     const ADMIN_KEYWORDS = ["Versioning", "Lifecycle", "Policy", "Cors", "Website", "Replication", "ObjectLock", "Encryption", "Logging", "Notification", "PublicAccess", "Ownership", "Acl"];
     if (ADMIN_KEYWORDS.some(kw => s3Operation.includes(kw)) || s3Operation.includes("BucketTagging")) {
         flags.push("admin_operation");
     }
     if (s3Operation.includes("Tagging")) flags.push("tagging_change");
-    
+
     if (status >= 400) flags.push("error_response");
     if (status === 403) flags.push("access_denied");
     if (status === 429) flags.push("dlp_quarantine_blocked");
@@ -1042,7 +1039,7 @@ function buildLogEntry({ licenseKey, gwHost, sourceIP, country, city, asn, asOrg
         riskLevel = (method === "GET" || method === "HEAD") ? "low" : "high";
     }
     else if (flags.includes("write_operation")) riskLevel = "medium";
-    
+
     if (status >= 400 && riskLevel === "info") riskLevel = "low";
 
     if (securityDecision && !securityDecision.allowed) {

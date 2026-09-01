@@ -181,6 +181,7 @@ export default {
         const url = new URL(request.url);
         const authHeader = request.headers.get("Authorization") || "";
         const configuredGatewayHost = (env.GATEWAY_HOST || "gateway.s3gw.com").toLowerCase();
+        const sourceIP = request.headers.get("CF-Connecting-IP") || "";
 
         if (!authHeader.startsWith("AWS4-HMAC-SHA256")) {
             return errorResponse(403, "AccessDenied", "AWS Signature V4 requise.", configuredGatewayHost);
@@ -197,7 +198,7 @@ export default {
         // Optimisation majeure : Cache mémoire global + Get parallèle pour 0 coût et 0 latence séquentielle
         const [license, quarantine] = await Promise.all([
             getCachedKV(env, licenseKey),
-            getCachedKV(env, `quarantine:${licenseKey}`)
+            getCachedKV(env, `quarantine:${licenseKey}:${sourceIP}`)
         ]);
 
         if (!license) {
@@ -249,7 +250,7 @@ export default {
         const queryString = url.search;
         const contentLength = parseInt(request.headers.get("Content-Length") || "0", 10);
         const userAgent = request.headers.get("User-Agent") || "";
-        const sourceIP = request.headers.get("CF-Connecting-IP") || "";
+        // sourceIP extracted earlier
         const country = request.cf?.country || "Unknown";
         const city = request.cf?.city || "Unknown";
         const asn = request.cf?.asn || "N/A";
@@ -331,7 +332,7 @@ export default {
         const envDisableStr = String(env.DISABLE_DLP_KV_WRITES || "").trim().toLowerCase();
         const disableDlpKv = envDisableStr === "true" || envDisableStr === "1" || env.DISABLE_DLP_KV_WRITES === true || license.disable_dlp_kv_writes === true || String(license.disable_dlp_kv_writes).trim().toLowerCase() === "true";
         if (!disableDlpKv && (backendResp.ok || backendResp.status === 304)) {
-            ctx.waitUntil(trackDlpQuotasAndQuarantine(env, licenseKey, license, method, s3Operation, actualBytes));
+            ctx.waitUntil(trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, method, s3Operation, actualBytes));
         }
 
         if (shouldLog) {
@@ -940,7 +941,7 @@ function checkSecurityPolicy(request, url, targetPath, license, s3Operation, sou
 // PILIER 2 : DLP QUOTAS GLISSANTS & QUARANTAINE (100% KV + TTL)
 // ============================================================
 
-async function trackDlpQuotasAndQuarantine(env, licenseKey, license, method, s3Operation, actualBytes) {
+async function trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, method, s3Operation, actualBytes) {
     try {
         const sec = license.security_policy || license.securityPolicy || {};
         const quotas = sec.dlp_quotas || sec.dlpQuotas;
@@ -955,7 +956,7 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, license, method, s3O
 
         // 1. Quota d'exfiltration en téléchargement (Bytes per hour)
         if ((method === "GET" || s3Operation === "getObject") && actualBytes > 0 && quotas.max_download_bytes_per_hour) {
-            const hourKey = `dlp:${licenseKey}:bytes:${ymd}-${hour}`;
+            const hourKey = `dlp:${licenseKey}:bytes:${sourceIP}:${ymd}-${hour}`;
             const currentStr = await env.LICENSES_KV.get(hourKey);
             const currentBytes = parseInt(currentStr || "0", 10);
             const newTotal = currentBytes + actualBytes;
@@ -963,7 +964,7 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, license, method, s3O
             await env.LICENSES_KV.put(hourKey, newTotal.toString(), { expirationTtl: 7200 }); // TTL 2h
 
             if (newTotal > quotas.max_download_bytes_per_hour) {
-                await env.LICENSES_KV.put(`quarantine:${licenseKey}`, JSON.stringify({
+                await env.LICENSES_KV.put(`quarantine:${licenseKey}:${sourceIP}`, JSON.stringify({
                     reason: "QUOTA_EXFILTRATION_BYTES_EXCEEDED",
                     bytes_downloaded: newTotal,
                     limit: quotas.max_download_bytes_per_hour,
@@ -974,7 +975,7 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, license, method, s3O
 
         // 2. Quota de requêtes GET par minute (Anti-aspiration / scan)
         if ((method === "GET" || s3Operation === "getObject" || s3Operation === "listObjects") && quotas.max_get_requests_per_minute) {
-            const minKey = `dlp:${licenseKey}:get:${ymd}-${hour}-${minute}`;
+            const minKey = `dlp:${licenseKey}:get:${sourceIP}:${ymd}-${hour}-${minute}`;
             const currentStr = await env.LICENSES_KV.get(minKey);
             const currentReqs = parseInt(currentStr || "0", 10);
             const newReqs = currentReqs + 1;
@@ -982,7 +983,7 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, license, method, s3O
             await env.LICENSES_KV.put(minKey, newReqs.toString(), { expirationTtl: 300 }); // TTL 5m
 
             if (newReqs > quotas.max_get_requests_per_minute) {
-                await env.LICENSES_KV.put(`quarantine:${licenseKey}`, JSON.stringify({
+                await env.LICENSES_KV.put(`quarantine:${licenseKey}:${sourceIP}`, JSON.stringify({
                     reason: "QUOTA_GET_REQUESTS_PER_MINUTE_EXCEEDED",
                     requests_count: newReqs,
                     limit: quotas.max_get_requests_per_minute,
@@ -993,7 +994,7 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, license, method, s3O
 
         // 3. Quota de requêtes DELETE par minute (Anti-wiper / destruction de masse)
         if ((method === "DELETE" || s3Operation.includes("delete")) && quotas.max_delete_requests_per_minute) {
-            const minKey = `dlp:${licenseKey}:del:${ymd}-${hour}-${minute}`;
+            const minKey = `dlp:${licenseKey}:del:${sourceIP}:${ymd}-${hour}-${minute}`;
             const currentStr = await env.LICENSES_KV.get(minKey);
             const currentReqs = parseInt(currentStr || "0", 10);
             const newReqs = currentReqs + 1;
@@ -1001,7 +1002,7 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, license, method, s3O
             await env.LICENSES_KV.put(minKey, newReqs.toString(), { expirationTtl: 300 }); // TTL 5m
 
             if (newReqs > quotas.max_delete_requests_per_minute) {
-                await env.LICENSES_KV.put(`quarantine:${licenseKey}`, JSON.stringify({
+                await env.LICENSES_KV.put(`quarantine:${licenseKey}:${sourceIP}`, JSON.stringify({
                     reason: "QUOTA_DELETE_REQUESTS_PER_MINUTE_EXCEEDED",
                     requests_count: newReqs,
                     limit: quotas.max_delete_requests_per_minute,

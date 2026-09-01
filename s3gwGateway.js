@@ -328,7 +328,8 @@ export default {
         const actualBytes = (method === "GET" || s3Operation === "getObject") ? respBytes : contentLength;
 
         // --- PILIER 2 : DLP QUOTAS & QUARANTAINE (Asynchrone non-bloquant via ctx.waitUntil) ---
-        const disableDlpKv = env.DISABLE_DLP_KV_WRITES === "true" || env.DISABLE_DLP_KV_WRITES === true || license.disable_dlp_kv_writes === true;
+        const envDisableStr = String(env.DISABLE_DLP_KV_WRITES || "").trim().toLowerCase();
+        const disableDlpKv = envDisableStr === "true" || envDisableStr === "1" || env.DISABLE_DLP_KV_WRITES === true || license.disable_dlp_kv_writes === true || String(license.disable_dlp_kv_writes).trim().toLowerCase() === "true";
         if (!disableDlpKv && (backendResp.ok || backendResp.status === 304)) {
             ctx.waitUntil(trackDlpQuotasAndQuarantine(env, licenseKey, license, method, s3Operation, actualBytes));
         }

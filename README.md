@@ -118,7 +118,7 @@ compatibility_date = "2026-07-11"
 
 [vars]
 GATEWAY_HOST = "s3gw.yourdomain.com" # Or your Cloudflare Worker domain (e.g. s3gw.my-tenant.workers.dev)
-# DISABLE_DLP_KV_WRITES = "true" # Optional: Set to true to disable real-time DLP quota tracking (KV writes) for "Audit Only" mode.
+# DISABLE_DLP_KV_WRITES = "true" # Set to "true" for Audit/SaaS Mode (disables DLP KV writes AND ignores Allowlists to prevent blocking valid traffic). Default is commented out (Standalone mode enabled).
 
 [[kv_namespaces]]
 binding = "LICENSES_KV"
@@ -130,8 +130,9 @@ bucket_name = "s3gw-audit-logs"
 ```
 
 > [!TIP]
-> **Audit-Only Mode (Save KV Costs)**
-> If you process DLP exfiltration quotas asynchronously in your backend SIEM (or via Tamper), you can add `DISABLE_DLP_KV_WRITES = "true"` to your `[vars]`. This will instruct the gateway to skip all quota KV write operations, saving significant Cloudflare KV write costs. The WAF/IPS blocking (Killswitch, IP/Geo-blocking) remains fully active.
+> **Audit-Only Mode (Save KV Costs & Avoid False Positives)**
+> By setting `DISABLE_DLP_KV_WRITES = "true"` in your `[vars]`, the gateway enters **Audit-Only / SaaS Mode**. In this mode, it behaves as an active but safe threat firewall: it enforces all **Blocklists** (IPs, Countries, User-Agents, ASNs, Ransomware Killswitch) but intentionally **ignores Allowlists** (whitelists) and **skips all DLP Quota KV writes**. This prevents accidental blocking of legitimate traffic due to a misconfigured allowlist and saves KV write costs.
+> If you deploy S3GW Standalone and want strict Zero-Trust enforcement (where anything not explicitly in the Allowlist is blocked) along with real-time DLP volumetric quotas, leave `DISABLE_DLP_KV_WRITES` commented out or set it to `"false"`.
 
 ### 3. Deploy to Cloudflare Edge
 ```bash

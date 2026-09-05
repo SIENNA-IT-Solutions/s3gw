@@ -293,7 +293,7 @@ export default {
         }
 
         // --- PILIER 1 : SECURITY POLICY ENGINE (IPS / WAF S3 Inline) ---
-        const secDecision = checkSecurityPolicy(request, url, targetPath, license, s3Operation, sourceIP, country, asn, userAgent);
+        const secDecision = checkSecurityPolicy(env, request, url, targetPath, license, s3Operation, sourceIP, country, asn, userAgent);
         if (!secDecision.allowed) {
             const durationMs = Date.now() - startMs;
             const logEntry = buildLogEntry({
@@ -762,138 +762,80 @@ function resolveS3Operation(method, path, queryString) {
 // PILIER 1 : MOTEUR DE SÉCURITÉ & INTERCEPTION S3GW (IPS/WAF)
 // ============================================================
 
-function checkSecurityPolicy(request, url, targetPath, license, s3Operation, sourceIP, country, asn, userAgent) {
+function checkSecurityPolicy(env, request, url, targetPath, license, s3Operation, sourceIP, country, asn, userAgent) {
     const sec = license.security_policy || license.securityPolicy || {};
+    const envDisableStr = String(env.DISABLE_DLP_KV_WRITES || "").trim().toLowerCase();
+    const auditMode = envDisableStr === "true" || envDisableStr === "1" || env.DISABLE_DLP_KV_WRITES === true || license.disable_dlp_kv_writes === true || String(license.disable_dlp_kv_writes).trim().toLowerCase() === "true";
 
     // 0. Filtrage par User-Agent
     const blockedUA = sec.blocked_user_agents || sec.blockedUserAgents || [];
     if (userAgent && blockedUA.some(ua => userAgent.toLowerCase().includes(String(ua).toLowerCase()))) {
-        return {
-            allowed: false,
-            status: 403,
-            code: "AccessDenied",
-            message: "Access blocked by S3GW Security Policy (User-Agent in denylist).",
-            blockReason: "USER_AGENT_DENYLIST",
-            riskLevel: "high"
-        };
+        return { allowed: false, status: 403, code: "AccessDenied", message: "Access blocked by S3GW Security Policy (User-Agent in denylist).", blockReason: "USER_AGENT_DENYLIST", riskLevel: "high" };
     }
 
-    const allowedUA = sec.allowed_user_agents || sec.allowedUserAgents || [];
-    if (allowedUA.length > 0 && userAgent && !allowedUA.some(ua => userAgent.toLowerCase().includes(String(ua).toLowerCase()))) {
-        return {
-            allowed: false,
-            status: 403,
-            code: "AccessDenied",
-            message: "Access blocked by S3GW Security Policy (User-Agent not in allowlist).",
-            blockReason: "USER_AGENT_NOT_ALLOWED",
-            riskLevel: "high"
-        };
+    if (!auditMode) {
+        const allowedUA = sec.allowed_user_agents || sec.allowedUserAgents || [];
+        if (allowedUA.length > 0 && userAgent && !allowedUA.some(ua => userAgent.toLowerCase().includes(String(ua).toLowerCase()))) {
+            return { allowed: false, status: 403, code: "AccessDenied", message: "Access blocked by S3GW Security Policy (User-Agent not in allowlist).", blockReason: "USER_AGENT_NOT_ALLOWED", riskLevel: "high" };
+        }
     }
 
     // 1. Filtrage par liste noire / blanche d'IP
     const blockedIps = sec.blocked_ips || sec.blockedIps || [];
     if (blockedIps.includes(sourceIP)) {
-        return {
-            allowed: false,
-            status: 403,
-            code: "AccessDenied",
-            message: "Access blocked by S3GW Security Policy (IP in denylist).",
-            blockReason: "IP_DENYLIST",
-            riskLevel: "high"
-        };
+        return { allowed: false, status: 403, code: "AccessDenied", message: "Access blocked by S3GW Security Policy (IP in denylist).", blockReason: "IP_DENYLIST", riskLevel: "high" };
     }
 
-    const allowedIps = sec.allowed_ips || sec.allowedIps || [];
-    if (allowedIps.length > 0 && !allowedIps.includes(sourceIP)) {
-        return {
-            allowed: false,
-            status: 403,
-            code: "AccessDenied",
-            message: "Access blocked by S3GW Security Policy (IP not in allowlist).",
-            blockReason: "IP_NOT_ALLOWED",
-            riskLevel: "high"
-        };
+    if (!auditMode) {
+        const allowedIps = sec.allowed_ips || sec.allowedIps || [];
+        if (allowedIps.length > 0 && !allowedIps.includes(sourceIP)) {
+            return { allowed: false, status: 403, code: "AccessDenied", message: "Access blocked by S3GW Security Policy (IP not in allowlist).", blockReason: "IP_NOT_ALLOWED", riskLevel: "high" };
+        }
     }
 
     // 2. Filtrage Géographique (Pays d'origine via Cloudflare Edge)
     const blockedCountries = sec.blocked_countries || sec.blockedCountries || [];
     if (country !== "Unknown" && blockedCountries.map(c => String(c).toUpperCase()).includes(String(country).toUpperCase())) {
-        return {
-            allowed: false,
-            status: 403,
-            code: "AccessDenied",
-            message: `Access blocked by S3GW Security Policy (Country ${country} is restricted).`,
-            blockReason: "GEO_RESTRICTED",
-            riskLevel: "high"
-        };
+        return { allowed: false, status: 403, code: "AccessDenied", message: `Access blocked by S3GW Security Policy (Country ${country} is restricted).`, blockReason: "GEO_RESTRICTED", riskLevel: "high" };
     }
 
-    const allowedCountries = sec.allowed_countries || sec.allowedCountries || [];
-    if (allowedCountries.length > 0 && country !== "Unknown" && !allowedCountries.map(c => String(c).toUpperCase()).includes(String(country).toUpperCase())) {
-        return {
-            allowed: false,
-            status: 403,
-            code: "AccessDenied",
-            message: `Access blocked by S3GW Security Policy (Country ${country} is not allowed).`,
-            blockReason: "GEO_NOT_ALLOWED",
-            riskLevel: "high"
-        };
+    if (!auditMode) {
+        const allowedCountries = sec.allowed_countries || sec.allowedCountries || [];
+        if (allowedCountries.length > 0 && country !== "Unknown" && !allowedCountries.map(c => String(c).toUpperCase()).includes(String(country).toUpperCase())) {
+            return { allowed: false, status: 403, code: "AccessDenied", message: `Access blocked by S3GW Security Policy (Country ${country} is not allowed).`, blockReason: "GEO_NOT_ALLOWED", riskLevel: "high" };
+        }
     }
 
     // 3. Filtrage ASN / ISP (ex: blocage hébergeurs suspects / nœuds TOR)
     const blockedAsns = sec.blocked_asns || sec.blockedAsns || [];
     const numAsn = typeof asn === "number" ? asn : parseInt(String(asn).replace("AS", ""), 10);
     if (!isNaN(numAsn) && blockedAsns.includes(numAsn)) {
-        return {
-            allowed: false,
-            status: 403,
-            code: "AccessDenied",
-            message: `Access blocked by S3GW Security Policy (ASN ${asn} is restricted).`,
-            blockReason: "ASN_BLOCKED",
-            riskLevel: "high"
-        };
+        return { allowed: false, status: 403, code: "AccessDenied", message: `Access blocked by S3GW Security Policy (ASN ${asn} is restricted).`, blockReason: "ASN_BLOCKED", riskLevel: "high" };
+    }
+
+    if (!auditMode) {
+        const allowedAsns = sec.allowed_asns || sec.allowedAsns || [];
+        if (allowedAsns.length > 0 && !isNaN(numAsn) && !allowedAsns.includes(numAsn)) {
+            return { allowed: false, status: 403, code: "AccessDenied", message: `Access blocked by S3GW Security Policy (ASN ${asn} is not allowed).`, blockReason: "ASN_NOT_ALLOWED", riskLevel: "high" };
+        }
     }
 
     // 4. Protection des opérations d'Administration (allow_admin_operations)
     const ADMIN_OPERATIONS = new Set([
-        "deleteBucket",
-        "putBucketVersioning",
-        "putBucketLifecycle",
-        "deleteBucketLifecycle",
-        "putObjectLockConfiguration",
-        "putBucketReplication",
-        "deleteBucketReplication",
-        "putBucketPolicy",
-        "deleteBucketPolicy",
-        "putBucketAcl",
-        "putBucketCors",
-        "deleteBucketCors",
-        "putBucketWebsite",
-        "deleteBucketWebsite",
-        "putBucketEncryption",
-        "deleteBucketEncryption",
-        "putBucketLogging",
-        "putBucketNotification",
-        "putPublicAccessBlock",
-        "deletePublicAccessBlock",
-        "putOwnershipControls",
-        "deleteOwnershipControls",
-        "putBucketTagging",
-        "deleteBucketTagging"
+        "deleteBucket", "putBucketVersioning", "putBucketLifecycle", "deleteBucketLifecycle",
+        "putObjectLockConfiguration", "putBucketReplication", "deleteBucketReplication",
+        "putBucketPolicy", "deleteBucketPolicy", "putBucketAcl", "putBucketCors",
+        "deleteBucketCors", "putBucketWebsite", "deleteBucketWebsite", "putBucketEncryption",
+        "deleteBucketEncryption", "putBucketLogging", "putBucketNotification",
+        "putPublicAccessBlock", "deletePublicAccessBlock", "putOwnershipControls",
+        "deleteOwnershipControls", "putBucketTagging", "deleteBucketTagging"
     ]);
 
     const allowAdmin = sec.allow_admin_operations !== undefined ? sec.allow_admin_operations :
         (license.allow_admin_operations !== undefined ? license.allow_admin_operations : true);
 
     if (allowAdmin === false && ADMIN_OPERATIONS.has(s3Operation)) {
-        return {
-            allowed: false,
-            status: 403,
-            code: "AccessDenied",
-            message: `Administrative operation '${s3Operation}' is forbidden by S3GW security policy on this access key.`,
-            blockReason: "ADMIN_OPERATION_FORBIDDEN_BY_GATEWAY_POLICY",
-            riskLevel: "high"
-        };
+        return { allowed: false, status: 403, code: "AccessDenied", message: `Administrative operation '${s3Operation}' is forbidden by S3GW security policy on this access key.`, blockReason: "ADMIN_OPERATION_FORBIDDEN_BY_GATEWAY_POLICY", riskLevel: "high" };
     }
 
     // 5. Ransomware Killswitch & Extension Filtering sur écritures
@@ -908,7 +850,7 @@ function checkSecurityPolicy(request, url, targetPath, license, s3Operation, sou
         ".yta", ".abc", ".ccc", ".vvv", ".micro", ".magic", ".exx", ".ezz", ".ecc"
     ];
 
-    const customBlockedExts = sec.custom_blocked_extensions || sec.customBlockedExtensions || [];
+    const customBlockedExts = sec.blocked_extensions || sec.blockedExtensions || [];
     const allBlockedExts = [...RANSOMWARE_EXTENSIONS, ...customBlockedExts].map(ext => ext.toLowerCase().startsWith('.') ? ext.toLowerCase() : '.' + ext.toLowerCase());
 
     const isPutMutation = ["putObject", "copyObject", "postObject", "uploadPart"].includes(s3Operation);
@@ -918,14 +860,20 @@ function checkSecurityPolicy(request, url, targetPath, license, s3Operation, sou
             if (lowerPath.endsWith(ext) || lowerPath.includes(ext + ".")) {
                 const killswitchActive = sec.ransomware_killswitch !== false; // Activé par défaut
                 if (killswitchActive) {
-                    return {
-                        allowed: false,
-                        status: 403,
-                        code: "AccessDenied",
-                        message: `Ransomware protection triggered: Uploading file with extension '${ext}' is blocked by S3GW killswitch.`,
-                        blockReason: "RANSOMWARE_EXTENSION_DETECTED",
-                        riskLevel: "critical"
-                    };
+                    return { allowed: false, status: 403, code: "AccessDenied", message: `Ransomware protection triggered: Uploading file with extension '${ext}' is blocked by S3GW killswitch.`, blockReason: "RANSOMWARE_EXTENSION_DETECTED", riskLevel: "critical" };
+                }
+            }
+        }
+
+        if (!auditMode) {
+            const allowedExts = sec.allowed_extensions || sec.allowedExtensions || [];
+            if (allowedExts.length > 0) {
+                const isAllowed = allowedExts.some(ext => {
+                    const formatted = ext.toLowerCase().startsWith('.') ? ext.toLowerCase() : '.' + ext.toLowerCase();
+                    return lowerPath.endsWith(formatted) || lowerPath.includes(formatted + ".");
+                });
+                if (!isAllowed) {
+                    return { allowed: false, status: 403, code: "AccessDenied", message: "Access blocked by S3GW Security Policy (File extension not in allowlist).", blockReason: "EXTENSION_NOT_ALLOWED", riskLevel: "high" };
                 }
             }
         }

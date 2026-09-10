@@ -60,6 +60,7 @@ These enriched logs are specifically designed to **feed your SIEM, SOC, and othe
   "ts": "2026-07-04T19:45:12.304Z",
   "licence": "DEMO_S3GW_KEY",
   "gateway": {
+    "host": "s3gw.yourdomain.com",
     "ip": "81.252.14.99",
     "country": "FR",
     "city": "Paris",
@@ -80,8 +81,12 @@ These enriched logs are specifically designed to **feed your SIEM, SOC, and othe
     "duration_ms": 142
   },
   "security": {
+    "action": "allowed",
     "risk_level": "medium",
-    "flags": ["write_operation"]
+    "block_reason": null,
+    "flags": [
+      "write_operation"
+    ]
   }
 }
 ```

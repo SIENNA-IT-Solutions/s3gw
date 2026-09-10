@@ -24,8 +24,8 @@
         "blocked_user_agents": [],
         "allowed_extensions": [],
         "blocked_extensions": [],
-        "allow_admin_operations": true,
-        "ransomware_killswitch": false,
+        "allow_admin_operations": false,
+        "ransomware_killswitch": true,
         "dlp_quotas": {
             "max_download_bytes_per_hour": 0,
             "max_get_requests_per_minute": 0,

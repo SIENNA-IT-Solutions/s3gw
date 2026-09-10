@@ -3,8 +3,12 @@ main = "s3gwGateway.js"
 compatibility_date = "2026-07-11"
 
 [vars]
-# Replace with your custom domain or Cloudflare Worker hostname
-GATEWAY_HOST = "s3gw.yourdomain.com"
+# Replace with your custom domain or Cloudflare Worker hostname (e.g. s3gw.yourdomain.com)
+GATEWAY_HOST = "gateway.domain.tld"
+
+# Audit-Only Mode (disables DLP KV writes to save costs and ignores allowlists)
+# Uncomment the line below to enable Audit-Only mode
+# DISABLE_DLP_KV_WRITES = "true"
 
 [[kv_namespaces]]
 binding = "LICENSES_KV"

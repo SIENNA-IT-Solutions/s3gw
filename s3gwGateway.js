@@ -1,143 +1,13 @@
 /**
- * ============================================================================
  * Cloudflare Worker — S3 Gateway Standalone (Audit & Logging)
- * ============================================================================
  *
- * Indications globales :
- * Ce code est conçu pour s'exécuter en tant que Worker Cloudflare. Il agit comme
- * une passerelle (reverse-proxy) S3 universelle, vérifie l'authentification AWS
- * Signature V4, forwarde les requêtes vers le fournisseur de stockage sous-jacent
- * et enregistre de manière non bloquante les logs d'audit des accès.
+ * Environment Variables (Bindings) to configure:
+ * 1. LICENSES_KV (KV Namespace)
+ * 2. R2_GATEWAY (R2 Bucket)
+ * 3. GATEWAY_HOST (Global Variable, e.g., gateway.domain.tld)
+ * 4. DISABLE_DLP_KV_WRITES (Global Variable, optional boolean)
  *
- * Variables d'environnement requises (Bindings Cloudflare Worker) :
- * ----------------------------------------------------------------------------
- * 1. LICENSES_KV (KV Namespace) :
- *    Namespace KV contenant les configurations et accès des clients/buckets.
- *    La clé (key) dans le KV correspond directement à l'Access Key ID utilisée
- *    par le client S3 lors de ses requêtes vers la gateway.
- *
- * 2. R2_GATEWAY (R2 Bucket) :
- *    Bucket R2 dans lequel seront stockés les logs d'audit générés par le Worker.
- *    Les fichiers sont enregistrés au format JSON de manière asynchrone.
- *
- *    Préfixage et arborescence des logs dans R2 :
- *    -------------------------------------------------------------------------
- *    Chaque log est stocké dans un fichier JSON unique et immutable sous le chemin :
- *    [licenseKey]/YYYY/MM/DD/log[8chars][timestamp].json
- *
- *    - [licenseKey] : Clé d'accès utilisée (ex: "DEMO_S3GW_KEY")
- *    - YYYY/MM/DD   : Date UTC (année/mois/jour) permettant un partionnement optimal
- *    - [8chars]     : 8 premiers caractères de la licence pour unicité visuelle
- *    - [timestamp]  : Horodatage millisecondes (epoch)
- *    Exemple de chemin R2 : DEMO_S3GW_KEY/2026/07/04/logDEMO_S3G1783280000000.json
- *
- * 3. GATEWAY_HOST (Variable globale / Environment Variable) :
- *    Le nom de domaine ou sous-domaine auquel on associe le code (ex: s3.mondomaine.com).
- *    Important : Il faut également lier ce Worker à ce sous-domaine via un
- *    Custom Domain ou une Route dans la configuration Cloudflare.
- *
- * 4. DISABLE_DLP_KV_WRITES (Variable globale / Environment Variable) :
- *    Optionnelle. Si définie à "true", la passerelle passe en mode "Audit Only" pour le DLP.
- *    Elle n'effectuera plus d'écritures KV (très coûteuses) pour suivre les quotas en
- *    temps réel (bytes par heure, reqs par minute). À utiliser si le calcul du DLP est
- *    déporté sur un backend asynchrone (comme le fait Tamper).
- *
- * Exemples de logs JSON enregistrés dans R2 :
- * ----------------------------------------------------------------------------
- * [Exemple 1 : Opération PUT (Écriture / Upload de fichier)]
- * {
- *   "ts": "2026-07-04T19:45:12.304Z",
- *   "licence": "DEMO_S3GW_KEY",
- *   "gateway": {
- *     "ip": "81.252.14.99",
- *     "country": "FR",
- *     "city": "Paris",
- *     "asn": "AS3215",
- *     "as_organization": "Orange SA",
- *     "user_agent": "aws-cli/2.15.0 Python/3.11.6 Linux/5.10.0-8-amd64",
- *     "access_key_used": "DEMO_S3GW_KEY"
- *   },
- *   "operation": {
- *     "method": "PUT",
- *     "type": "putObject",
- *     "bucket": "my-target-bucket",
- *     "key": "/reports/2026_Q3_financial_audit.pdf"
- *   },
- *   "response": {
- *     "status": 200,
- *     "bytes": 4582910,
- *     "duration_ms": 142
- *   },
- *   "security": {
- *     "risk_level": "medium",
- *     "flags": ["write_operation"]
- *   }
- * }
- *
- * [Exemple 2 : Opération GET (Lecture / Téléchargement)]
- * {
- *   "ts": "2026-07-04T19:48:05.892Z",
- *   "licence": "DEMO_S3GW_KEY",
- *   "gateway": {
- *     "ip": "185.220.101.5",
- *     "country": "DE",
- *     "city": "Frankfurt",
- *     "asn": "AS24940",
- *     "as_organization": "Hetzner Online GmbH",
- *     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Veeam/12",
- *     "access_key_used": "DEMO_S3GW_KEY"
- *   },
- *   "operation": {
- *     "method": "GET",
- *     "type": "getObject",
- *     "bucket": "my-target-bucket",
- *     "key": "/backup/db_prod_daily.bak"
- *   },
- *   "response": {
- *     "status": 200,
- *     "bytes": 1073741824,
- *     "duration_ms": 850
- *   },
- *   "security": {
- *     "risk_level": "info",
- *     "flags": ["read_operation"]
- *   }
- * }
- *
- * Exemple de JSON nécessaire dans le KV (Clé = Access Key ID, ex: "DEMO_S3GW_KEY") :
- * ----------------------------------------------------------------------------
- * {
- *   "activated": true,
- *   "expires_at": "2030-12-31T23:59:59Z",
- *   "gateway": {
- *     "enabled": true,
- *     "access_key": "DEMO_S3GW_KEY",
- *     "secret_key": "4c38d72e61be92d4b68e0d9843c081e3f892a0d1762c"
- *   },
- *   "bucket": "my-target-bucket",
- *   "endpoint": "s3.eu-west-3.amazonaws.com",
- *   "region": "eu-west-3",
- *   "accessKey": "AKIAX_REAL_S3_ACCESS_KEY",
- *   "secretKey": "REAL_S3_SECRET_KEY_abc123",
- *   "forceVirtualHost": true,
- *   "forcePathStyle": false,
- *   "security_policy": {
- *     "allowed_countries": ["FR", "DE", "BE", "CH", "US"],
- *     "blocked_countries": ["RU", "CN", "KP", "IR"],
- *     "blocked_asns": [4134, 4837, 3462],
- *     "allowed_ips": [],
- *     "blocked_ips": ["185.220.101.5"],
- *     "allow_admin_operations": false,
- *     "ransomware_killswitch": true,
- *     "dlp_quotas": {
- *       "max_download_bytes_per_hour": 10737418240,
- *       "max_get_requests_per_minute": 600,
- *       "max_delete_requests_per_minute": 60,
- *       "quarantine_duration_seconds": 3600
- *     }
- *   }
- * }
- * ============================================================================
+ * Note: Bind this Worker to your prefered's subdomain (e.g., gateway.domain.tld).
  */
 
 const LOGGABLE_METHODS = new Set(["PUT", "DELETE", "POST", "GET"]);
@@ -259,7 +129,6 @@ export default {
 
         const startMs = Date.now();
 
-        // --- PILIER 2 : DLP QUARANTAINE CHECK (Vérification immédiate sans surcoût KV) ---
         if (quarantine) {
             const durationMs = Date.now() - startMs;
             const logEntry = buildLogEntry({
@@ -292,7 +161,6 @@ export default {
             return errorResponse(429, "SlowDown", `S3GW Exfiltration Guard: Access key is quarantined (${quarantine.reason || "Quota exceeded"}). Try again later.`, configuredGatewayHost);
         }
 
-        // --- PILIER 1 : SECURITY POLICY ENGINE (IPS / WAF S3 Inline) ---
         const secDecision = checkSecurityPolicy(env, request, url, targetPath, license, s3Operation, sourceIP, country, asn, userAgent);
         if (!secDecision.allowed) {
             const durationMs = Date.now() - startMs;
@@ -328,7 +196,6 @@ export default {
         const respBytes = parseInt(backendResp.headers.get("Content-Length") || "0", 10);
         const actualBytes = (method === "GET" || s3Operation === "getObject") ? respBytes : contentLength;
 
-        // --- PILIER 2 : DLP QUOTAS & QUARANTAINE (Asynchrone non-bloquant via ctx.waitUntil) ---
         const envDisableStr = String(env.DISABLE_DLP_KV_WRITES || "").trim().toLowerCase();
         const disableDlpKv = envDisableStr === "true" || envDisableStr === "1" || env.DISABLE_DLP_KV_WRITES === true || license.disable_dlp_kv_writes === true || String(license.disable_dlp_kv_writes).trim().toLowerCase() === "true";
         if (!disableDlpKv && (backendResp.ok || backendResp.status === 304)) {
@@ -758,10 +625,6 @@ function resolveS3Operation(method, path, queryString) {
     return `${method.toLowerCase()}Unknown`;
 }
 
-// ============================================================
-// PILIER 1 : MOTEUR DE SÉCURITÉ & INTERCEPTION S3GW (IPS/WAF)
-// ============================================================
-
 function checkSecurityPolicy(env, request, url, targetPath, license, s3Operation, sourceIP, country, asn, userAgent) {
     const sec = license.security_policy || license.securityPolicy || {};
     const envDisableStr = String(env.DISABLE_DLP_KV_WRITES || "").trim().toLowerCase();
@@ -881,10 +744,6 @@ function checkSecurityPolicy(env, request, url, targetPath, license, s3Operation
 
     return { allowed: true };
 }
-
-// ============================================================
-// PILIER 2 : DLP QUOTAS GLISSANTS & QUARANTAINE (100% KV + TTL)
-// ============================================================
 
 async function trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, method, s3Operation, actualBytes) {
     try {

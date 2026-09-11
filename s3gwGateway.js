@@ -394,13 +394,17 @@ async function forwardToBackend(request, originalUrl, targetPath, license, env) 
         "leviia.com",
         "r2.cloudflarestorage.com",
         "cloud-object-storage.appdomain.cloud",
+        "objectstorage.softlayer.net",
         "aliyuncs.com",
         "myqcloud.com",
         "digitaloceanspaces.com",
         "storage.googleapis.com",
         "linodeobjects.com",
         "exoscale.com",
-        "hetzner.com"
+        "hetzner.com",
+        "outscale.com",
+        "core.windows.net",
+        "oraclecloud.com"
     ];
 
     const preferVirtualHost = license.forceVirtualHost ?? VIRTUAL_HOST_PROVIDERS.some(domain => backendEndpoint.toLowerCase().includes(domain));

@@ -8,7 +8,7 @@
 
 **S3GW** is an open-source, free, On-Prem/DIY cybersecurity product explicitly designed for **Developers, DevSecOps, and DevOps**. Executing with **0ms sequential overhead** on Cloudflare Workers, S3GW acts as a transparent reverse-proxy and Active Threat Firewall for the S3 protocol.
 
-Whether your buckets are hosted on **AWS S3, Cloudflare R2, Scaleway, Hetzner, OVHcloud, Wasabi, or Google Cloud Storage**, S3GW provides real-time access control, behavioral threat blocking, data exfiltration quotas, and enriched JSON audit logging—**without requiring any modifications to your S3 client SDKs or applications**.
+Whether your buckets are hosted on **AWS S3, Cloudflare R2, Scaleway, Hetzner, OVHcloud, Wasabi, or Backblaze B2**, S3GW provides real-time access control, behavioral threat blocking, data exfiltration quotas, and enriched JSON audit logging—**without requiring any modifications to your S3 client SDKs or applications**.
 
 ---
 

@@ -69,6 +69,14 @@ function setBoundedMap(map, maxEntries, key, value) {
     map.set(key, value);
 }
 
+function getLicensesKv(env) {
+    return env?.LICENSES_KV || env?.LICENSES || null;
+}
+
+function getR2Gateway(env) {
+    return env?.R2_GATEWAY || env?.S3GW_R2 || null;
+}
+
 async function getCachedKV(env, key, customNegativeTtlMs = NEGATIVE_CACHE_TTL_MS) {
     const now = Date.now();
     if (kvCache.has(key)) {
@@ -81,7 +89,9 @@ async function getCachedKV(env, key, customNegativeTtlMs = NEGATIVE_CACHE_TTL_MS
         }
         kvCache.delete(key);
     }
-    const data = await env.LICENSES_KV.get(key, { type: "json" });
+    const kv = getLicensesKv(env);
+    if (!kv) return null;
+    const data = await kv.get(key, { type: "json" });
     const ttl = data === null ? customNegativeTtlMs : CACHE_TTL_MS;
     setBoundedMap(kvCache, MAX_KV_CACHE_ENTRIES, key, { data, timestamp: now, ttl });
     return data;
@@ -841,7 +851,9 @@ async function checkSingleUseTokenConsumed(env, licenseKey, jti, disableKv = fal
         consumedTokenCache.delete(cacheKey);
     }
     if (disableKv) return false;
-    const kvVal = await env.LICENSES_KV.get(`used_token:${cacheKey}`);
+    const kv = getLicensesKv(env);
+    if (!kv) return false;
+    const kvVal = await kv.get(`used_token:${cacheKey}`);
     return kvVal !== null;
 }
 
@@ -852,7 +864,10 @@ async function markSingleUseTokenConsumed(env, licenseKey, jti, remainingTtlSeco
     setBoundedMap(consumedTokenCache, MAX_CONSUMED_TOKEN_CACHE_ENTRIES, cacheKey, Date.now() + ttlSec * 1000);
     if (disableKv) return;
     try {
-        await env.LICENSES_KV.put(`used_token:${cacheKey}`, "1", { expirationTtl: ttlSec });
+        const kv = getLicensesKv(env);
+        if (kv) {
+            await kv.put(`used_token:${cacheKey}`, "1", { expirationTtl: ttlSec });
+        }
     } catch (_) {
     }
 }
@@ -2302,14 +2317,15 @@ function checkSecurityPolicy(env, request, url, targetPath, license, s3Operation
 }
 
 async function incrementDlpCounter(env, counterKey, delta, ttlSeconds) {
+    const kv = getLicensesKv(env);
     const now = Date.now();
     let memEntry = dlpMemoryCounters.get(counterKey);
     if (!memEntry || now > memEntry.expiresAt) {
         memEntry = { total: 0, initializedFromKv: false, expiresAt: now + ttlSeconds * 1000 };
     }
 
-    if (!memEntry.initializedFromKv) {
-        const currentStr = await env.LICENSES_KV.get(counterKey);
+    if (!memEntry.initializedFromKv && kv) {
+        const currentStr = await kv.get(counterKey);
         const kvVal = parseInt(currentStr || "0", 10);
         memEntry.total = Math.max(memEntry.total, isNaN(kvVal) ? 0 : kvVal);
         memEntry.initializedFromKv = true;
@@ -2318,18 +2334,22 @@ async function incrementDlpCounter(env, counterKey, delta, ttlSeconds) {
     memEntry.total += delta;
     setBoundedMap(dlpMemoryCounters, MAX_DLP_COUNTER_ENTRIES, counterKey, memEntry);
 
-    await env.LICENSES_KV.put(counterKey, memEntry.total.toString(), { expirationTtl: ttlSeconds });
+    if (kv) {
+        await kv.put(counterKey, memEntry.total.toString(), { expirationTtl: ttlSeconds });
+    }
     return memEntry.total;
 }
 
 async function triggerKeyQuarantine(env, licenseKey, sourceIP, quarantinePayload, quarantineDuration) {
     setQuarantineCacheImmediate(licenseKey, quarantinePayload, quarantineDuration);
+    const kv = getLicensesKv(env);
+    if (!kv) return;
     const body = JSON.stringify(quarantinePayload);
     const puts = [
-        env.LICENSES_KV.put(`quarantine:${licenseKey}`, body, { expirationTtl: quarantineDuration })
+        kv.put(`quarantine:${licenseKey}`, body, { expirationTtl: quarantineDuration })
     ];
     if (sourceIP) {
-        puts.push(env.LICENSES_KV.put(`quarantine:${licenseKey}:${sourceIP}`, body, { expirationTtl: quarantineDuration }));
+        puts.push(kv.put(`quarantine:${licenseKey}:${sourceIP}`, body, { expirationTtl: quarantineDuration }));
     }
     await Promise.all(puts);
 }
@@ -2497,7 +2517,8 @@ function generateRandomHex(byteLen = 3) {
 
 async function writeLog(env, licenseKey, logEntry) {
     try {
-        if (!env.R2_GATEWAY) return;
+        const r2 = getR2Gateway(env);
+        if (!r2) return;
         const now = new Date();
         const year = now.getUTCFullYear();
         const month = String(now.getUTCMonth() + 1).padStart(2, "0");
@@ -2509,7 +2530,7 @@ async function writeLog(env, licenseKey, logEntry) {
 
         const r2Path = `${safePrefix}/${year}/${month}/${day}/log${shortKey}${ts}_${randSuffix}.json`;
 
-        await env.R2_GATEWAY.put(r2Path, JSON.stringify(logEntry), {
+        await r2.put(r2Path, JSON.stringify(logEntry), {
             httpMetadata: { contentType: "application/json" },
         });
     } catch (e) {

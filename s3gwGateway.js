@@ -1,45 +1,63 @@
-/**
- * Cloudflare Worker — S3 Gateway Standalone (Audit & Logging)
- *
- * Environment Variables (Bindings) to configure:
- * 1. LICENSES_KV (KV Namespace)
- * 2. R2_GATEWAY (R2 Bucket)
- * 3. GATEWAY_HOST (Global Variable, e.g., gateway.domain.tld)
- * 4. DISABLE_DLP_KV_WRITES (Global Variable, optional boolean)
- * 5. CORS_ALLOWED_ORIGINS (Global Variable, optional comma-separated origins)
- *
- * Note: Bind this Worker to your prefered's subdomain (e.g., gateway.domain.tld).
- */
-
-const LOGGABLE_METHODS = new Set(["PUT", "DELETE", "POST", "GET"]);
+const LOGGABLE_METHODS = new Set(["PUT", "DELETE", "POST", "GET", "HEAD"]);
 
 const LOGGABLE_POST_ACTIONS = new Set([
     "completeMultipartUpload",
     "createMultipartUpload",
     "restoreObject",
     "deleteObjects",
+    "createPresignedUrl",
 ]);
 
-// Cache mémoire global borné (LRU) pour réduire les appels KV (coût & latence)
 const kvCache = new Map();
-const CACHE_TTL_MS = 60000; // 60 secondes pour licences et quarantaines actives
-const NEGATIVE_CACHE_TTL_MS = 5000; // 5 secondes pour les entrées absentes (null)
+const CACHE_TTL_MS = 60000;
+const NEGATIVE_CACHE_TTL_MS = 5000;
 const MAX_KV_CACHE_ENTRIES = 1000;
 
-// Cache mémoire borné (LRU) pour les clés de signature SigV4 journalières (CryptoKey)
 const signingKeyCache = new Map();
-const SIGNING_KEY_TTL_MS = 24 * 60 * 60 * 1000; // 24 heures
+const SIGNING_KEY_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SIGNING_KEY_CACHE_ENTRIES = 500;
 
-// Accumulateur mémoire DLP pour éviter la fenêtre aveugle et les race conditions sur un même isolate
+const tokenCryptoKeyCache = new Map();
+const MAX_TOKEN_KEY_CACHE_ENTRIES = 500;
+
+const consumedTokenCache = new Map();
+const MAX_CONSUMED_TOKEN_CACHE_ENTRIES = 2000;
+
 const dlpMemoryCounters = new Map();
 const MAX_DLP_COUNTER_ENTRIES = 2000;
 
-// Fenêtre anti-rejeu SigV4 (standard AWS S3 : ±15 minutes)
 const MAX_SIGV4_CLOCK_SKEW_MS = 15 * 60 * 1000;
+const DEFAULT_PRESIGN_TTL_SECONDS = 900;
+const DEFAULT_MAX_PRESIGN_TTL_SECONDS = 86400;
 
-// Validation stricte du format d'Access Key avant tout appel KV (anti-DoS cache/KV)
 const ACCESS_KEY_FORMAT_REGEX = /^[A-Za-z0-9_.-]{8,128}$/;
+
+const PRESIGN_SIGV4_QUERY_KEYS = new Set([
+    "x-amz-algorithm",
+    "x-amz-credential",
+    "x-amz-date",
+    "x-amz-expires",
+    "x-amz-signedheaders",
+    "x-amz-signature",
+    "x-amz-security-token",
+]);
+
+const CLOAKED_HEADER_PREFIXES = [
+    "x-amz-",
+    "x-scw-",
+    "x-ovh-",
+    "x-rgw-",
+    "x-oss-",
+    "x-cos-",
+    "x-b2-",
+    "x-guploader-",
+];
+
+const CLOAKED_EXACT_HEADERS = new Set([
+    "server",
+    "x-powered-by",
+    "via",
+]);
 
 function setBoundedMap(map, maxEntries, key, value) {
     if (map.has(key)) {
@@ -57,7 +75,6 @@ async function getCachedKV(env, key, customNegativeTtlMs = NEGATIVE_CACHE_TTL_MS
         const cached = kvCache.get(key);
         const ttl = cached.ttl ?? (cached.data === null ? customNegativeTtlMs : CACHE_TTL_MS);
         if (now - cached.timestamp < ttl) {
-            // Promotion LRU
             kvCache.delete(key);
             kvCache.set(key, cached);
             return cached.data;
@@ -79,7 +96,6 @@ function setQuarantineCacheImmediate(licenseKey, quarantineObj, durationSeconds)
     });
 }
 
-// Décodage URI récursif (protège contre %6C, %256C, etc.)
 function fullyDecodeURIComponent(str, maxPasses = 5) {
     let current = String(str ?? "");
     for (let i = 0; i < maxPasses; i++) {
@@ -88,7 +104,6 @@ function fullyDecodeURIComponent(str, maxPasses = 5) {
             if (decoded === current) break;
             current = decoded;
         } catch (e) {
-            // Décodage caractère par caractère si une séquence %XX isolée est malformée
             const partial = current.replace(/%[0-9a-fA-F]{2}/g, (m) => {
                 try { return decodeURIComponent(m); } catch (_) { return m; }
             });
@@ -99,7 +114,6 @@ function fullyDecodeURIComponent(str, maxPasses = 5) {
     return current;
 }
 
-// Normalisation sécurisée du chemin S3 (décodage récursif + détection de traversal)
 function normalizeAndInspectPath(rawPath) {
     const rawStr = String(rawPath || "/");
     const rawSegments = rawStr.split("/");
@@ -149,7 +163,6 @@ export default {
         const asn = request.cf?.asn || "N/A";
         const asOrganization = request.cf?.asOrganization || "Unknown ISP";
 
-        // Résolution préliminaire du chemin pour journalisation SIEM homogène
         let rawTargetPath = url.pathname;
         const hostName = url.hostname.toLowerCase();
         if (hostName !== configuredGatewayHost && hostName.endsWith("." + configuredGatewayHost)) {
@@ -157,11 +170,25 @@ export default {
             rawTargetPath = `/${vhBucket}${rawTargetPath === "/" ? "" : rawTargetPath}`;
         }
 
-        const { normalizedPath, segments: pathParts, hasTraversal } = normalizeAndInspectPath(rawTargetPath);
-        const requestedBucket = pathParts.length > 0 ? pathParts[0] : "";
-        const s3Operation = resolveS3Operation(method, normalizedPath, queryString, request.headers);
+        if (rawTargetPath === "/_s3gw/presign") {
+            return handlePresignMintRequest({
+                request, env, ctx, url, startMs, configuredGatewayHost, corsAllowedOrigins,
+                authHeader, sourceIP, method, contentLength, userAgent, country, city, asn, asOrganization
+            });
+        }
 
-        const logAndReject = (logLicenseKey, gwKeyUsed, bucketForLog, status, code, message, blockReason, riskLevel = "high", policyCorsOrigins = corsAllowedOrigins) => {
+        if (rawTargetPath.startsWith("/dl/") || rawTargetPath.startsWith("/s/")) {
+            return handleCloakedTokenRequest({
+                request, env, ctx, url, rawTargetPath, startMs, configuredGatewayHost, corsAllowedOrigins,
+                sourceIP, method, contentLength, userAgent, country, city, asn, asOrganization
+            });
+        }
+
+        let { normalizedPath, segments: pathParts, hasTraversal } = normalizeAndInspectPath(rawTargetPath);
+        let requestedBucket = pathParts.length > 0 ? pathParts[0] : "";
+        let s3Operation = resolveS3Operation(method, normalizedPath, queryString, request.headers);
+
+        const logAndReject = (logLicenseKey, gwKeyUsed, bucketForLog, status, code, message, blockReason, riskLevel = "high", policyCorsOrigins = corsAllowedOrigins, authMeta = undefined) => {
             const durationMs = Date.now() - startMs;
             const logEntry = buildLogEntry({
                 licenseKey: logLicenseKey,
@@ -180,6 +207,7 @@ export default {
                 contentLength,
                 status,
                 durationMs,
+                authMeta,
                 securityDecision: {
                     allowed: false,
                     status,
@@ -195,20 +223,28 @@ export default {
             return errorResponse(status, code, message, configuredGatewayHost, request, policyCorsOrigins);
         };
 
-        if (!authHeader.startsWith("AWS4-HMAC-SHA256")) {
+        const isHeaderSigV4 = authHeader.startsWith("AWS4-HMAC-SHA256");
+        const isQuerySigV4 = !isHeaderSigV4 && (url.searchParams.get("X-Amz-Algorithm") === "AWS4-HMAC-SHA256");
+        const authMeta = { mode: isQuerySigV4 ? "sigv4_presigned_query" : "sigv4_header" };
+
+        if (!isHeaderSigV4 && !isQuerySigV4) {
             return logAndReject(
                 "_unauthenticated",
                 "NONE",
                 requestedBucket,
                 403,
                 "AccessDenied",
-                "AWS Signature V4 requise.",
+                "AWS Signature V4 ou lien pré-signé requis.",
                 "MISSING_AWS_SIGV4_AUTH",
-                "medium"
+                "medium",
+                corsAllowedOrigins,
+                authMeta
             );
         }
 
-        const gwAccessKeyReceived = extractAccessKeyFromAuth(authHeader);
+        const gwAccessKeyReceived = isQuerySigV4
+            ? extractAccessKeyFromQuery(url.searchParams)
+            : extractAccessKeyFromAuth(authHeader);
 
         if (!gwAccessKeyReceived || gwAccessKeyReceived === "-" || !ACCESS_KEY_FORMAT_REGEX.test(gwAccessKeyReceived)) {
             return logAndReject(
@@ -219,13 +255,14 @@ export default {
                 "InvalidAccessKeyId",
                 "Access key invalide.",
                 "MALFORMED_ACCESS_KEY_ID",
-                "high"
+                "high",
+                corsAllowedOrigins,
+                authMeta
             );
         }
 
         const licenseKey = gwAccessKeyReceived;
 
-        // Optimisation majeure : Cache mémoire LRU + Get parallèle (quarantaine globale par clé ET par IP)
         const [license, keyQuarantine, ipQuarantine] = await Promise.all([
             getCachedKV(env, licenseKey),
             getCachedKV(env, `quarantine:${licenseKey}`),
@@ -242,7 +279,9 @@ export default {
                 "InvalidAccessKeyId",
                 "Clé de licence inconnue.",
                 "UNKNOWN_LICENSE_KEY",
-                "high"
+                "high",
+                corsAllowedOrigins,
+                authMeta
             );
         }
 
@@ -263,7 +302,8 @@ export default {
                 "Licence désactivée.",
                 "LICENSE_DEACTIVATED",
                 "medium",
-                licenseCorsOrigins
+                licenseCorsOrigins,
+                authMeta
             );
         }
 
@@ -277,7 +317,8 @@ export default {
                 "Licence expirée.",
                 "LICENSE_EXPIRED",
                 "medium",
-                licenseCorsOrigins
+                licenseCorsOrigins,
+                authMeta
             );
         }
 
@@ -291,7 +332,8 @@ export default {
                 "Gateway non activée pour cette licence.",
                 "GATEWAY_DISABLED",
                 "medium",
-                licenseCorsOrigins
+                licenseCorsOrigins,
+                authMeta
             );
         }
 
@@ -306,24 +348,63 @@ export default {
                 "Access key ne correspond pas à cette licence.",
                 "ACCESS_KEY_MISMATCH",
                 "high",
-                licenseCorsOrigins
+                licenseCorsOrigins,
+                authMeta
             );
         }
 
+        const presignedCfg = resolvePresignedConfig(license);
         const licenseGatewaySecretKey = license.gateway.secret_key || license.gateway.secretKey;
-        const sigResult = await verifyAwsSigV4(request, licenseGatewaySecretKey, url);
+
+        if (isQuerySigV4) {
+            if (!presignedCfg.enabled || !presignedCfg.allowSigv4Query) {
+                return logAndReject(
+                    licenseKey,
+                    gwAccessKeyReceived,
+                    license.bucket,
+                    403,
+                    "AccessDenied",
+                    "Presigned URLs are disabled for this gateway license.",
+                    "PRESIGNED_URLS_DISABLED",
+                    "high",
+                    licenseCorsOrigins,
+                    authMeta
+                );
+            }
+            if (!presignedCfg.allowedMethods.includes(method)) {
+                return logAndReject(
+                    licenseKey,
+                    gwAccessKeyReceived,
+                    license.bucket,
+                    403,
+                    "AccessDenied",
+                    `HTTP method '${method}' is not allowed for presigned URLs.`,
+                    "PRESIGNED_METHOD_NOT_ALLOWED",
+                    "high",
+                    licenseCorsOrigins,
+                    authMeta
+                );
+            }
+        }
+
+        const sigResult = isQuerySigV4
+            ? await verifyAwsSigV4PresignedQuery(request, licenseGatewaySecretKey, url, presignedCfg.maxTtlSeconds)
+            : await verifyAwsSigV4(request, licenseGatewaySecretKey, url);
+
         if (!sigResult.valid) {
-            const isSkew = sigResult.reason === "RequestTimeTooSkewed";
+            const isExpired = sigResult.reason === "RequestExpired";
+            const isSkew = sigResult.reason === "RequestTimeTooSkewed" || isExpired;
             return logAndReject(
                 licenseKey,
                 gwAccessKeyReceived,
                 license.bucket,
                 403,
-                isSkew ? "RequestTimeTooSkewed" : "SignatureDoesNotMatch",
-                isSkew ? "L'horodatage de la requête dépasse la fenêtre autorisée (15 minutes)." : "Signature AWS invalide.",
-                isSkew ? "SIGV4_REPLAY_OR_CLOCK_SKEW" : "INVALID_AWS_SIGNATURE",
-                "high",
-                licenseCorsOrigins
+                isExpired ? "AccessDenied" : (isSkew ? "RequestTimeTooSkewed" : "SignatureDoesNotMatch"),
+                isExpired ? "Request has expired." : (isSkew ? "L'horodatage de la requête dépasse la fenêtre autorisée." : "Signature AWS invalide."),
+                isExpired ? "PRESIGNED_URL_EXPIRED" : (isSkew ? "SIGV4_REPLAY_OR_CLOCK_SKEW" : "INVALID_AWS_SIGNATURE"),
+                isExpired ? "medium" : "high",
+                licenseCorsOrigins,
+                authMeta
             );
         }
 
@@ -337,8 +418,20 @@ export default {
                 "Path traversal sequences are not allowed.",
                 "PATH_TRAVERSAL_DETECTED",
                 "critical",
-                licenseCorsOrigins
+                licenseCorsOrigins,
+                authMeta
             );
+        }
+
+        if (requestedBucket === "_" && license.bucket) {
+            const restSegments = pathParts.slice(1);
+            rawTargetPath = `/${license.bucket}/${restSegments.join("/")}${rawTargetPath.endsWith("/") && restSegments.length > 0 ? "/" : ""}`;
+            normalizedPath = `/${license.bucket}${restSegments.length > 0 ? "/" + restSegments.join("/") : ""}${normalizedPath.endsWith("/") && restSegments.length > 0 ? "/" : ""}`;
+            pathParts = [license.bucket, ...restSegments];
+            requestedBucket = license.bucket;
+            s3Operation = resolveS3Operation(method, normalizedPath, isQuerySigV4 ? stripSigV4QueryParams(url.searchParams) : queryString, request.headers);
+        } else if (isQuerySigV4) {
+            s3Operation = resolveS3Operation(method, normalizedPath, stripSigV4QueryParams(url.searchParams), request.headers);
         }
 
         if (requestedBucket && requestedBucket !== license.bucket) {
@@ -351,11 +444,11 @@ export default {
                 "Access to this bucket is not allowed by your license.",
                 "UNAUTHORIZED_BUCKET_ACCESS",
                 "high",
-                licenseCorsOrigins
+                licenseCorsOrigins,
+                authMeta
             );
         }
 
-        // Inspection stricte du header x-amz-copy-source (anti-exfiltration cross-bucket)
         const rawCopySource = request.headers.get("x-amz-copy-source");
         if (rawCopySource !== null) {
             const copyCheck = validateCopySourceHeader(rawCopySource, license.bucket);
@@ -369,7 +462,8 @@ export default {
                     copyCheck.message,
                     copyCheck.blockReason,
                     "critical",
-                    licenseCorsOrigins
+                    licenseCorsOrigins,
+                    authMeta
                 );
             }
         }
@@ -384,7 +478,8 @@ export default {
                 `S3GW Exfiltration Guard: Access key is quarantined (${quarantine.reason || "Quota exceeded"}). Try again later.`,
                 "QUARANTINED_BY_QUOTA",
                 "high",
-                licenseCorsOrigins
+                licenseCorsOrigins,
+                authMeta
             );
         }
 
@@ -399,13 +494,13 @@ export default {
                 secDecision.message,
                 secDecision.blockReason || "SECURITY_POLICY_VIOLATION",
                 secDecision.riskLevel || "high",
-                licenseCorsOrigins
+                licenseCorsOrigins,
+                authMeta
             );
         }
 
-        // Réponse synthétique ListAllMyBucketsResult sur GET / pour la compatibilité des clients GUI (Cyberduck, S3 Browser, WinSCP)
         if (!requestedBucket && license.bucket) {
-            if (method === "GET") {
+            if (method === "GET" && !isQuerySigV4) {
                 const synthResp = buildSyntheticListBucketsResponse(license, request, licenseCorsOrigins);
                 const durationMs = Date.now() - startMs;
                 const logEntry = buildLogEntry({
@@ -425,6 +520,7 @@ export default {
                     contentLength: 0,
                     status: 200,
                     durationMs,
+                    authMeta,
                     securityDecision: undefined
                 });
                 if (env.R2_GATEWAY && ctx?.waitUntil) {
@@ -441,14 +537,13 @@ export default {
                 "Listing or mutating root without bucket is not allowed. Please specify your bucket.",
                 "ROOT_OPERATION_NOT_ALLOWED",
                 "medium",
-                licenseCorsOrigins
+                licenseCorsOrigins,
+                authMeta
             );
         }
 
-        const envDisableStr = String(env.DISABLE_DLP_KV_WRITES || "").trim().toLowerCase();
-        const disableDlpKv = envDisableStr === "true" || envDisableStr === "1" || env.DISABLE_DLP_KV_WRITES === true || license.disable_dlp_kv_writes === true || String(license.disable_dlp_kv_writes).trim().toLowerCase() === "true";
+        const disableDlpKv = isDlpKvWritesDisabled(env, license);
 
-        // Comptage exact du nombre d'objets dans un batch POST ?delete (deleteObjects)
         let deleteObjectsCount = 1;
         let preReadBodyBuffer = null;
         if (s3Operation === "deleteObjects" && request.body && contentLength <= 2 * 1024 * 1024) {
@@ -460,7 +555,6 @@ export default {
                 deleteObjectsCount = 1;
             }
 
-            // Blocage préventif immédiat si un seul batch delete dépasse déjà le quota par minute
             const quotas = (license.security_policy || license.securityPolicy || {}).dlp_quotas || (license.security_policy || license.securityPolicy || {}).dlpQuotas;
             if (!disableDlpKv && quotas?.max_delete_requests_per_minute && deleteObjectsCount > quotas.max_delete_requests_per_minute) {
                 ctx.waitUntil(trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, method, s3Operation, 0, deleteObjectsCount));
@@ -473,14 +567,17 @@ export default {
                     `S3GW Exfiltration Guard: Batch delete of ${deleteObjectsCount} objects exceeds per-minute delete quota (${quotas.max_delete_requests_per_minute}). Access key is now quarantined.`,
                     "QUOTA_DELETE_REQUESTS_PER_MINUTE_EXCEEDED",
                     "critical",
-                    licenseCorsOrigins
+                    licenseCorsOrigins,
+                    authMeta
                 );
             }
         }
 
         const shouldLog = decideShouldLog(method, s3Operation, contentLength);
 
-        const backendResp = await forwardToBackend(request, url, rawTargetPath, license, env, preReadBodyBuffer);
+        const backendResp = await forwardToBackend(request, url, rawTargetPath, license, env, preReadBodyBuffer, {
+            stripSigV4Query: isQuerySigV4
+        });
         const durationMs = Date.now() - startMs;
 
         const respBytes = parseInt(backendResp.headers.get("Content-Length") || "0", 10);
@@ -508,13 +605,16 @@ export default {
                 contentLength: actualBytes,
                 status: backendResp.status,
                 durationMs,
+                authMeta,
                 securityDecision: undefined
             });
 
             ctx.waitUntil(writeLog(env, licenseKey, logEntry));
         }
 
-        const respHeaders = new Headers(backendResp.headers);
+        const respHeaders = sanitizeBackendResponseHeaders(backendResp.headers, license, {
+            fullCloak: isQuerySigV4
+        });
         applyCorsHeaders(respHeaders, request, licenseCorsOrigins);
         if (!backendResp.ok) {
             respHeaders.set("Cache-Control", "no-transform");
@@ -527,6 +627,858 @@ export default {
         });
     },
 };
+
+function resolvePresignedConfig(license) {
+    const gw = license?.gateway || {};
+    const cfg = gw.presigned_urls || gw.presignedUrls || license?.presigned_urls || license?.presignedUrls || {};
+    const enabled = cfg.enabled !== false;
+    const allowEncryptedTokens = cfg.allow_encrypted_tokens !== false && cfg.allowEncryptedTokens !== false;
+    const allowHmacTokens = cfg.allow_hmac_tokens !== false && cfg.allowHmacTokens !== false;
+    const allowSigv4Query = cfg.allow_sigv4_query !== false && cfg.allowSigv4Query !== false;
+    const allowBearerMinting = cfg.allow_bearer_minting !== false && cfg.allowBearerMinting !== false;
+    const enforceSingleUse = cfg.enforce_single_use === true || cfg.enforceSingleUse === true;
+    const defaultTtlSeconds = Math.max(1, parseInt(cfg.default_ttl_seconds ?? cfg.defaultTtlSeconds ?? DEFAULT_PRESIGN_TTL_SECONDS, 10) || DEFAULT_PRESIGN_TTL_SECONDS);
+    const maxTtlSeconds = Math.max(defaultTtlSeconds, parseInt(cfg.max_ttl_seconds ?? cfg.maxTtlSeconds ?? DEFAULT_MAX_PRESIGN_TTL_SECONDS, 10) || DEFAULT_MAX_PRESIGN_TTL_SECONDS);
+    const rawMethods = cfg.allowed_methods || cfg.allowedMethods || ["GET", "HEAD"];
+    const allowedMethods = Array.isArray(rawMethods) && rawMethods.length > 0
+        ? rawMethods.map(m => String(m).trim().toUpperCase())
+        : ["GET", "HEAD"];
+    if (allowedMethods.includes("GET") && !allowedMethods.includes("HEAD")) {
+        allowedMethods.push("HEAD");
+    }
+    return {
+        enabled,
+        allowEncryptedTokens,
+        allowHmacTokens,
+        allowSigv4Query,
+        allowBearerMinting,
+        enforceSingleUse,
+        defaultTtlSeconds,
+        maxTtlSeconds,
+        allowedMethods
+    };
+}
+
+function base64UrlEncodeBytes(bytes) {
+    let bin = "";
+    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    for (let i = 0; i < u8.length; i++) {
+        bin += String.fromCharCode(u8[i]);
+    }
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlDecodeToBytes(str) {
+    try {
+        if (!str || typeof str !== "string" || !/^[A-Za-z0-9_-]+$/.test(str)) return null;
+        let b64 = str.replace(/-/g, "+").replace(/_/g, "/");
+        while (b64.length % 4 !== 0) b64 += "=";
+        const bin = atob(b64);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) {
+            out[i] = bin.charCodeAt(i);
+        }
+        return out;
+    } catch (_) {
+        return null;
+    }
+}
+
+async function getCachedTokenCryptoKeys(secret) {
+    const cacheKey = `tok:${secret}`;
+    const now = Date.now();
+    if (tokenCryptoKeyCache.has(cacheKey)) {
+        const entry = tokenCryptoKeyCache.get(cacheKey);
+        if (now - entry.timestamp < SIGNING_KEY_TTL_MS) {
+            tokenCryptoKeyCache.delete(cacheKey);
+            tokenCryptoKeyCache.set(cacheKey, entry);
+            return entry;
+        }
+        tokenCryptoKeyCache.delete(cacheKey);
+    }
+    const [aesRaw, hmacKeyBytes] = await Promise.all([
+        hmacRaw(enc("S3GW_CLOAK_AES_V1"), secret),
+        hmacRaw(enc("S3GW_CLOAK_HMAC_V1"), secret)
+    ]);
+    const [aesKey, hmacKey] = await Promise.all([
+        crypto.subtle.importKey("raw", aesRaw, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]),
+        crypto.subtle.importKey("raw", hmacKeyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"])
+    ]);
+    const entry = { aesKey, hmacKey, timestamp: now };
+    setBoundedMap(tokenCryptoKeyCache, MAX_TOKEN_KEY_CACHE_ENTRIES, cacheKey, entry);
+    return entry;
+}
+
+async function mintCloakedToken(accessKey, secretKey, payloadObj, mode = "encrypted") {
+    const akB64 = base64UrlEncodeBytes(enc(accessKey));
+    const jsonBytes = enc(JSON.stringify(payloadObj));
+    const { aesKey, hmacKey } = await getCachedTokenCryptoKeys(secretKey);
+
+    if (mode === "hmac") {
+        const payloadB64 = base64UrlEncodeBytes(jsonBytes);
+        const signingInput = `v1.${akB64}.${payloadB64}`;
+        const sigBytes = new Uint8Array(await crypto.subtle.sign("HMAC", hmacKey, enc(signingInput)));
+        return `${signingInput}.${base64UrlEncodeBytes(sigBytes)}`;
+    }
+
+    const iv = new Uint8Array(12);
+    crypto.getRandomValues(iv);
+    const cipherBuf = await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv, additionalData: enc(accessKey) },
+        aesKey,
+        jsonBytes
+    );
+    const cipherBytes = new Uint8Array(cipherBuf);
+    const combined = new Uint8Array(iv.length + cipherBytes.length);
+    combined.set(iv, 0);
+    combined.set(cipherBytes, iv.length);
+    return `v1e.${akB64}.${base64UrlEncodeBytes(combined)}`;
+}
+
+function extractAccessKeyFromCloakedToken(rawToken) {
+    if (!rawToken || typeof rawToken !== "string") return null;
+    const parts = rawToken.split(".");
+    if (parts.length < 3) return null;
+    const version = parts[0];
+    if (version !== "v1e" && version !== "v1") return null;
+    const akBytes = base64UrlDecodeToBytes(parts[1]);
+    if (!akBytes) return null;
+    try {
+        const ak = new TextDecoder().decode(akBytes);
+        return ACCESS_KEY_FORMAT_REGEX.test(ak) ? { version, accessKey: ak, parts } : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+async function verifyAndDecodeCloakedToken(parsedToken, secretKey, presignedCfg) {
+    try {
+        const { version, accessKey, parts } = parsedToken;
+        const { aesKey, hmacKey } = await getCachedTokenCryptoKeys(secretKey);
+
+        let payloadBytes = null;
+        if (version === "v1e") {
+            if (!presignedCfg.allowEncryptedTokens) return { valid: false, reason: "EncryptedTokensDisabled" };
+            if (parts.length !== 3) return { valid: false, reason: "MalformedToken" };
+            const combined = base64UrlDecodeToBytes(parts[2]);
+            if (!combined || combined.byteLength < 29) return { valid: false, reason: "MalformedCiphertext" };
+            const iv = combined.subarray(0, 12);
+            const ciphertext = combined.subarray(12);
+            const decryptedBuf = await crypto.subtle.decrypt(
+                { name: "AES-GCM", iv, additionalData: enc(accessKey) },
+                aesKey,
+                ciphertext
+            );
+            payloadBytes = new Uint8Array(decryptedBuf);
+        } else if (version === "v1") {
+            if (!presignedCfg.allowHmacTokens) return { valid: false, reason: "HmacTokensDisabled" };
+            if (parts.length !== 4) return { valid: false, reason: "MalformedToken" };
+            const signingInput = `v1.${parts[1]}.${parts[2]}`;
+            const receivedSig = base64UrlDecodeToBytes(parts[3]);
+            if (!receivedSig || receivedSig.byteLength !== 32) return { valid: false, reason: "MalformedSignature" };
+            const computedSig = new Uint8Array(await crypto.subtle.sign("HMAC", hmacKey, enc(signingInput)));
+            if (!timingSafeEqualBytes(computedSig, receivedSig)) {
+                return { valid: false, reason: "SignatureDoesNotMatch" };
+            }
+            payloadBytes = base64UrlDecodeToBytes(parts[2]);
+            if (!payloadBytes) return { valid: false, reason: "MalformedPayload" };
+        } else {
+            return { valid: false, reason: "UnsupportedVersion" };
+        }
+
+        const payload = JSON.parse(new TextDecoder().decode(payloadBytes));
+        if (!payload || typeof payload !== "object" || typeof payload.k !== "string" || !payload.k) {
+            return { valid: false, reason: "InvalidPayloadClaims" };
+        }
+
+        const nowSec = Math.floor(Date.now() / 1000);
+        const expSec = Number(payload.exp);
+        if (!Number.isFinite(expSec) || nowSec > expSec) {
+            return { valid: false, reason: "TokenExpired", payload };
+        }
+
+        const iatSec = Number(payload.iat || nowSec);
+        if (expSec - iatSec > presignedCfg.maxTtlSeconds + 60) {
+            return { valid: false, reason: "TtlExceedsPolicyMax", payload };
+        }
+
+        return {
+            valid: true,
+            mode: version === "v1e" ? "cloaked_token_encrypted" : "cloaked_token_hmac",
+            payload
+        };
+    } catch (_) {
+        return { valid: false, reason: "InvalidOrTamperedToken" };
+    }
+}
+
+async function verifyConstantTimeSecret(expectedSecret, providedSecret) {
+    if (!expectedSecret || !providedSecret) return false;
+    const [h1, h2] = await Promise.all([
+        crypto.subtle.digest("SHA-256", enc(String(expectedSecret))),
+        crypto.subtle.digest("SHA-256", enc(String(providedSecret)))
+    ]);
+    return timingSafeEqualBytes(new Uint8Array(h1), new Uint8Array(h2));
+}
+
+function isDlpKvWritesDisabled(env, license) {
+    const envDisableStr = String(env?.DISABLE_DLP_KV_WRITES || "").trim().toLowerCase();
+    if (envDisableStr === "true" || envDisableStr === "1" || env?.DISABLE_DLP_KV_WRITES === true) return true;
+    if (license?.disable_dlp_kv_writes === true || String(license?.disable_dlp_kv_writes || "").trim().toLowerCase() === "true") return true;
+    const sec = license?.security_policy || license?.securityPolicy || {};
+    const quotas = sec.dlp_quotas ?? sec.dlpQuotas;
+    if (quotas === false || quotas?.enabled === false) return true;
+    return false;
+}
+
+async function checkSingleUseTokenConsumed(env, licenseKey, jti, disableKv = false) {
+    if (!jti) return true;
+    const cacheKey = `${licenseKey}:${jti}`;
+    const now = Date.now();
+    if (consumedTokenCache.has(cacheKey)) {
+        const exp = consumedTokenCache.get(cacheKey);
+        if (now < exp) return true;
+        consumedTokenCache.delete(cacheKey);
+    }
+    if (disableKv) return false;
+    const kvVal = await env.LICENSES_KV.get(`used_token:${cacheKey}`);
+    return kvVal !== null;
+}
+
+async function markSingleUseTokenConsumed(env, licenseKey, jti, remainingTtlSeconds, disableKv = false) {
+    if (!jti) return;
+    const cacheKey = `${licenseKey}:${jti}`;
+    const ttlSec = Math.max(60, Math.min(86400, (Number(remainingTtlSeconds) || 900) + 60));
+    setBoundedMap(consumedTokenCache, MAX_CONSUMED_TOKEN_CACHE_ENTRIES, cacheKey, Date.now() + ttlSec * 1000);
+    if (disableKv) return;
+    try {
+        await env.LICENSES_KV.put(`used_token:${cacheKey}`, "1", { expirationTtl: ttlSec });
+    } catch (_) {
+    }
+}
+
+async function handlePresignMintRequest({
+    request, env, ctx, url, startMs, configuredGatewayHost, corsAllowedOrigins,
+    authHeader, sourceIP, method, contentLength, userAgent, country, city, asn, asOrganization
+}) {
+    const s3Operation = "createPresignedUrl";
+    const jsonReject = (logLicenseKey, gwKeyUsed, bucketForLog, status, code, message, blockReason, riskLevel = "high", policyCorsOrigins = corsAllowedOrigins, authMeta = { mode: "presign_mint" }) => {
+        const durationMs = Date.now() - startMs;
+        const logEntry = buildLogEntry({
+            licenseKey: logLicenseKey,
+            gwHost: configuredGatewayHost,
+            sourceIP,
+            country,
+            city,
+            asn,
+            asOrganization,
+            userAgent,
+            gwAccessKey: gwKeyUsed,
+            method,
+            s3Operation,
+            path: "/_s3gw/presign",
+            bucket: bucketForLog || "unknown",
+            contentLength,
+            status,
+            durationMs,
+            authMeta,
+            securityDecision: { allowed: false, status, code, message, blockReason, riskLevel }
+        });
+        if (env.R2_GATEWAY && ctx?.waitUntil) {
+            ctx.waitUntil(writeLog(env, logLicenseKey, logEntry));
+        }
+        const headers = new Headers({
+            "Content-Type": "application/json; charset=utf-8",
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-store",
+            "Server": "s3gw"
+        });
+        applyCorsHeaders(headers, request, policyCorsOrigins);
+        return new Response(JSON.stringify({ error: code, message }), { status, headers });
+    };
+
+    if (method !== "POST") {
+        return jsonReject("_unauthenticated", "NONE", "unknown", 405, "MethodNotAllowed", "Only POST is allowed on /_s3gw/presign.", "INVALID_MINT_METHOD", "low");
+    }
+
+    let gwAccessKeyReceived = "";
+    let bearerSecretProvided = null;
+    const isSigV4 = authHeader.startsWith("AWS4-HMAC-SHA256");
+    const isBearer = authHeader.startsWith("Bearer ");
+
+    if (isSigV4) {
+        gwAccessKeyReceived = extractAccessKeyFromAuth(authHeader);
+    } else if (isBearer) {
+        const rawCreds = authHeader.slice(7).trim();
+        const sepIdx = rawCreds.indexOf(":");
+        if (sepIdx > 0) {
+            gwAccessKeyReceived = rawCreds.slice(0, sepIdx).trim();
+            bearerSecretProvided = rawCreds.slice(sepIdx + 1).trim();
+        }
+    } else {
+        return jsonReject("_unauthenticated", "NONE", "unknown", 403, "AccessDenied", "Authentication required (AWS4-HMAC-SHA256 or Bearer <access_key>:<secret_key>).", "MISSING_MINT_AUTH", "medium");
+    }
+
+    if (!gwAccessKeyReceived || !ACCESS_KEY_FORMAT_REGEX.test(gwAccessKeyReceived)) {
+        return jsonReject("_unauthenticated", gwAccessKeyReceived || "INVALID", "unknown", 403, "InvalidAccessKeyId", "Invalid gateway access key.", "MALFORMED_ACCESS_KEY_ID", "high");
+    }
+
+    const licenseKey = gwAccessKeyReceived;
+    const [license, keyQuarantine, ipQuarantine] = await Promise.all([
+        getCachedKV(env, licenseKey),
+        getCachedKV(env, `quarantine:${licenseKey}`),
+        sourceIP ? getCachedKV(env, `quarantine:${licenseKey}:${sourceIP}`) : Promise.resolve(null)
+    ]);
+    const quarantine = keyQuarantine || ipQuarantine;
+
+    if (!license) {
+        return jsonReject("_unauthenticated", gwAccessKeyReceived, "unknown", 403, "InvalidAccessKeyId", "Unknown license key.", "UNKNOWN_LICENSE_KEY", "high");
+    }
+
+    const licenseCorsOrigins = parseAllowedOrigins(
+        license.security_policy?.allowed_origins ||
+        license.securityPolicy?.allowedOrigins ||
+        license.cors_allowed_origins ||
+        env.CORS_ALLOWED_ORIGINS
+    );
+
+    if (!license.activated || new Date(license.expires_at) < new Date() || !license.gateway?.enabled) {
+        return jsonReject(licenseKey, gwAccessKeyReceived, license.bucket, 403, "AccessDenied", "License or gateway is inactive or expired.", "LICENSE_INACTIVE_OR_EXPIRED", "medium", licenseCorsOrigins);
+    }
+
+    const presignedCfg = resolvePresignedConfig(license);
+    if (!presignedCfg.enabled) {
+        return jsonReject(licenseKey, gwAccessKeyReceived, license.bucket, 403, "AccessDenied", "Presigned URLs are disabled for this license.", "PRESIGNED_URLS_DISABLED", "high", licenseCorsOrigins);
+    }
+
+    const licenseGatewayAccessKey = license.gateway.access_key || license.gateway.accessKey;
+    const licenseGatewaySecretKey = license.gateway.secret_key || license.gateway.secretKey;
+    if (licenseGatewayAccessKey !== gwAccessKeyReceived) {
+        return jsonReject(licenseKey, gwAccessKeyReceived, license.bucket, 403, "InvalidAccessKeyId", "Access key mismatch.", "ACCESS_KEY_MISMATCH", "high", licenseCorsOrigins);
+    }
+
+    if (isBearer) {
+        if (!presignedCfg.allowBearerMinting) {
+            return jsonReject(licenseKey, gwAccessKeyReceived, license.bucket, 403, "AccessDenied", "Bearer token minting is disabled; use AWS SigV4.", "BEARER_MINTING_DISABLED", "high", licenseCorsOrigins);
+        }
+        const secretValid = await verifyConstantTimeSecret(licenseGatewaySecretKey, bearerSecretProvided);
+        if (!secretValid) {
+            return jsonReject(licenseKey, gwAccessKeyReceived, license.bucket, 403, "SignatureDoesNotMatch", "Invalid gateway secret key.", "INVALID_BEARER_SECRET", "high", licenseCorsOrigins);
+        }
+    } else {
+        const sigResult = await verifyAwsSigV4(request, licenseGatewaySecretKey, url);
+        if (!sigResult.valid) {
+            return jsonReject(licenseKey, gwAccessKeyReceived, license.bucket, 403, "SignatureDoesNotMatch", "Invalid AWS SigV4 signature.", "INVALID_AWS_SIGNATURE", "high", licenseCorsOrigins);
+        }
+    }
+
+    if (quarantine) {
+        return jsonReject(licenseKey, gwAccessKeyReceived, license.bucket, 429, "SlowDown", `Access key is quarantined (${quarantine.reason || "Quota exceeded"}).`, "QUARANTINED_BY_QUOTA", "high", licenseCorsOrigins);
+    }
+
+    let bodyObj = null;
+    try {
+        bodyObj = await request.json();
+    } catch (_) {
+        return jsonReject(licenseKey, gwAccessKeyReceived, license.bucket, 400, "MalformedJSON", "Request body must be valid JSON.", "MALFORMED_MINT_JSON", "low", licenseCorsOrigins);
+    }
+
+    const rawKey = String(bodyObj?.key || bodyObj?.object_key || bodyObj?.path || "").trim();
+    if (!rawKey) {
+        return jsonReject(licenseKey, gwAccessKeyReceived, license.bucket, 400, "InvalidArgument", "Missing required 'key' field.", "MISSING_OBJECT_KEY", "low", licenseCorsOrigins);
+    }
+
+    const { segments: keySegments, hasTraversal } = normalizeAndInspectPath(rawKey);
+    if (hasTraversal || keySegments.length === 0) {
+        return jsonReject(licenseKey, gwAccessKeyReceived, license.bucket, 400, "InvalidURI", "Invalid or traversal object key.", "PATH_TRAVERSAL_DETECTED", "critical", licenseCorsOrigins);
+    }
+
+    const cleanSegments = (keySegments[0] === license.bucket && keySegments.length > 1)
+        ? keySegments.slice(1)
+        : keySegments;
+    const cleanObjectKey = cleanSegments.join("/");
+    const simulatedTargetPath = `/${license.bucket}/${cleanObjectKey}`;
+
+    const requestedMethod = String(bodyObj?.method || "GET").trim().toUpperCase();
+    if (!presignedCfg.allowedMethods.includes(requestedMethod)) {
+        return jsonReject(licenseKey, gwAccessKeyReceived, license.bucket, 403, "AccessDenied", `Method '${requestedMethod}' is not allowed for presigned URLs on this bucket.`, "PRESIGNED_METHOD_NOT_ALLOWED", "high", licenseCorsOrigins);
+    }
+
+    const simulatedOp = requestedMethod === "PUT" ? "putObject" : (requestedMethod === "HEAD" ? "headObject" : "getObject");
+    const secDecision = checkSecurityPolicy(env, request, url, simulatedTargetPath, license, simulatedOp, sourceIP, country, asn, userAgent);
+    if (!secDecision.allowed) {
+        return jsonReject(licenseKey, gwAccessKeyReceived, license.bucket, secDecision.status || 403, secDecision.code || "AccessDenied", secDecision.message, secDecision.blockReason, secDecision.riskLevel || "high", licenseCorsOrigins);
+    }
+
+    const reqTtl = parseInt(bodyObj?.expires_in ?? bodyObj?.ttl ?? presignedCfg.defaultTtlSeconds, 10);
+    const effectiveTtl = Math.min(presignedCfg.maxTtlSeconds, Math.max(1, isNaN(reqTtl) ? presignedCfg.defaultTtlSeconds : reqTtl));
+    const nowSec = Math.floor(Date.now() / 1000);
+    const expSec = nowSec + effectiveTtl;
+    const singleUse = Boolean(bodyObj?.single_use || bodyObj?.singleUse || presignedCfg.enforceSingleUse);
+    const jti = generateRandomHex(8);
+    const correlationId = bodyObj?.correlation_id || bodyObj?.correlationId ? String(bodyObj.correlation_id || bodyObj.correlationId).slice(0, 128) : undefined;
+    const ipBind = bodyObj?.ip_bind || bodyObj?.ipBind ? String(bodyObj.ip_bind || bodyObj.ipBind).trim() : undefined;
+
+    if (ipBind && !parseIpAddress(ipBind.split("/")[0])) {
+        return jsonReject(licenseKey, gwAccessKeyReceived, license.bucket, 400, "InvalidArgument", "Invalid ip_bind IP/CIDR format.", "INVALID_IP_BIND", "low", licenseCorsOrigins);
+    }
+
+    let disposition = bodyObj?.disposition || bodyObj?.content_disposition ? String(bodyObj.disposition || bodyObj.content_disposition).trim() : undefined;
+    if (!disposition && bodyObj?.filename) {
+        const safeFn = String(bodyObj.filename).replace(/["\r\n\\]/g, "_");
+        disposition = `attachment; filename="${safeFn}"`;
+    }
+    const contentTypeOverride = bodyObj?.content_type || bodyObj?.contentType ? String(bodyObj.content_type || bodyObj.contentType).trim() : undefined;
+
+    const requestedMode = String(bodyObj?.mode || "encrypted").trim().toLowerCase() === "hmac" ? "hmac" : "encrypted";
+    if (requestedMode === "encrypted" && !presignedCfg.allowEncryptedTokens) {
+        return jsonReject(licenseKey, gwAccessKeyReceived, license.bucket, 403, "AccessDenied", "Encrypted tokens are disabled.", "ENCRYPTED_TOKENS_DISABLED", "medium", licenseCorsOrigins);
+    }
+    if (requestedMode === "hmac" && !presignedCfg.allowHmacTokens) {
+        return jsonReject(licenseKey, gwAccessKeyReceived, license.bucket, 403, "AccessDenied", "HMAC tokens are disabled.", "HMAC_TOKENS_DISABLED", "medium", licenseCorsOrigins);
+    }
+
+    const tokenPayload = {
+        k: cleanObjectKey,
+        m: requestedMethod,
+        iat: nowSec,
+        exp: expSec,
+        jti
+    };
+    if (singleUse) tokenPayload.su = 1;
+    if (ipBind) tokenPayload.ip = ipBind;
+    if (disposition) tokenPayload.cd = disposition;
+    if (contentTypeOverride) tokenPayload.ct = contentTypeOverride;
+    if (correlationId) tokenPayload.cid = correlationId;
+
+    const token = await mintCloakedToken(licenseGatewayAccessKey, licenseGatewaySecretKey, tokenPayload, requestedMode);
+    const routePrefix = bodyObj?.short_prefix === "s" ? "/s/" : "/dl/";
+    const publicOrigin = `${url.protocol}//${url.host}`;
+    const presignedUrl = `${publicOrigin}${routePrefix}${token}`;
+
+    const durationMs = Date.now() - startMs;
+    const authMeta = {
+        mode: isBearer ? "presign_mint_bearer" : "presign_mint_sigv4",
+        tokenJti: jti,
+        correlationId,
+        singleUse,
+        ipBound: ipBind || null
+    };
+
+    const logEntry = buildLogEntry({
+        licenseKey,
+        gwHost: configuredGatewayHost,
+        sourceIP,
+        country,
+        city,
+        asn,
+        asOrganization,
+        userAgent,
+        gwAccessKey: gwAccessKeyReceived,
+        method,
+        s3Operation,
+        path: simulatedTargetPath,
+        bucket: license.bucket,
+        contentLength: 0,
+        status: 200,
+        durationMs,
+        authMeta,
+        securityDecision: undefined
+    });
+    if (env.R2_GATEWAY && ctx?.waitUntil) {
+        ctx.waitUntil(writeLog(env, licenseKey, logEntry));
+    }
+
+    const respHeaders = new Headers({
+        "Content-Type": "application/json; charset=utf-8",
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "no-store",
+        "Server": "s3gw"
+    });
+    applyCorsHeaders(respHeaders, request, licenseCorsOrigins);
+
+    return new Response(JSON.stringify({
+        url: presignedUrl,
+        token,
+        mode: requestedMode,
+        method: requestedMethod,
+        expires_in: effectiveTtl,
+        expires_at: new Date(expSec * 1000).toISOString(),
+        single_use: singleUse,
+        ip_bind: ipBind || null,
+        jti,
+        correlation_id: correlationId || null
+    }), { status: 200, headers: respHeaders });
+}
+
+async function handleCloakedTokenRequest({
+    request, env, ctx, url, rawTargetPath, startMs, configuredGatewayHost, corsAllowedOrigins,
+    sourceIP, method, contentLength, userAgent, country, city, asn, asOrganization
+}) {
+    const prefixLen = rawTargetPath.startsWith("/dl/") ? 4 : 3;
+    const rawToken = rawTargetPath.slice(prefixLen).split("/")[0].trim();
+
+    const rejectToken = (logLicenseKey, gwKeyUsed, bucketForLog, loggedPath, opType, status, code, message, blockReason, riskLevel = "high", policyCorsOrigins = corsAllowedOrigins, authMeta = { mode: "cloaked_token" }) => {
+        const durationMs = Date.now() - startMs;
+        const logEntry = buildLogEntry({
+            licenseKey: logLicenseKey,
+            gwHost: configuredGatewayHost,
+            sourceIP,
+            country,
+            city,
+            asn,
+            asOrganization,
+            userAgent,
+            gwAccessKey: gwKeyUsed,
+            method,
+            s3Operation: opType,
+            path: loggedPath,
+            bucket: bucketForLog || "unknown",
+            contentLength,
+            status,
+            durationMs,
+            authMeta,
+            securityDecision: { allowed: false, status, code, message, blockReason, riskLevel }
+        });
+        if (env.R2_GATEWAY && ctx?.waitUntil) {
+            ctx.waitUntil(writeLog(env, logLicenseKey, logEntry));
+        }
+        return errorResponse(status, code, message, configuredGatewayHost, request, policyCorsOrigins);
+    };
+
+    const parsedOuter = extractAccessKeyFromCloakedToken(rawToken);
+    if (!parsedOuter) {
+        return rejectToken("_unauthenticated", "INVALID", "unknown", "/dl/_invalid_token", "getObject", 403, "AccessDenied", "Invalid or malformed download link.", "MALFORMED_CLOAKED_TOKEN", "medium");
+    }
+
+    const gwAccessKeyReceived = parsedOuter.accessKey;
+    const licenseKey = gwAccessKeyReceived;
+
+    const [license, keyQuarantine, ipQuarantine] = await Promise.all([
+        getCachedKV(env, licenseKey),
+        getCachedKV(env, `quarantine:${licenseKey}`),
+        sourceIP ? getCachedKV(env, `quarantine:${licenseKey}:${sourceIP}`) : Promise.resolve(null)
+    ]);
+    const quarantine = keyQuarantine || ipQuarantine;
+
+    if (!license) {
+        return rejectToken("_unauthenticated", gwAccessKeyReceived, "unknown", "/dl/_unknown_license", "getObject", 403, "InvalidAccessKeyId", "Invalid link credentials.", "UNKNOWN_LICENSE_KEY", "high");
+    }
+
+    const licenseCorsOrigins = parseAllowedOrigins(
+        license.security_policy?.allowed_origins ||
+        license.securityPolicy?.allowedOrigins ||
+        license.cors_allowed_origins ||
+        env.CORS_ALLOWED_ORIGINS
+    );
+
+    if (!license.activated || new Date(license.expires_at) < new Date() || !license.gateway?.enabled) {
+        return rejectToken(licenseKey, gwAccessKeyReceived, license.bucket, `/${license.bucket}/_inactive`, "getObject", 403, "AccessDenied", "Gateway license is inactive or expired.", "LICENSE_INACTIVE_OR_EXPIRED", "medium", licenseCorsOrigins);
+    }
+
+    const presignedCfg = resolvePresignedConfig(license);
+    if (!presignedCfg.enabled) {
+        return rejectToken(licenseKey, gwAccessKeyReceived, license.bucket, `/${license.bucket}/_disabled`, "getObject", 403, "AccessDenied", "Presigned URLs are disabled.", "PRESIGNED_URLS_DISABLED", "high", licenseCorsOrigins);
+    }
+
+    const licenseGatewayAccessKey = license.gateway.access_key || license.gateway.accessKey;
+    const licenseGatewaySecretKey = license.gateway.secret_key || license.gateway.secretKey;
+    if (licenseGatewayAccessKey !== gwAccessKeyReceived) {
+        return rejectToken(licenseKey, gwAccessKeyReceived, license.bucket, `/${license.bucket}/_mismatch`, "getObject", 403, "InvalidAccessKeyId", "Access key mismatch.", "ACCESS_KEY_MISMATCH", "high", licenseCorsOrigins);
+    }
+
+    const verified = await verifyAndDecodeCloakedToken(parsedOuter, licenseGatewaySecretKey, presignedCfg);
+    if (!verified.valid) {
+        const isExpired = verified.reason === "TokenExpired";
+        const p = verified.payload;
+        const partialKey = p?.k ? `/${license.bucket}/${String(p.k).replace(/^\/+/, "")}` : `/${license.bucket}/_unverified_token`;
+        return rejectToken(
+            licenseKey,
+            gwAccessKeyReceived,
+            license.bucket,
+            partialKey,
+            "getObject",
+            403,
+            "AccessDenied",
+            isExpired ? "Download link has expired." : "Invalid or tampered download link.",
+            isExpired ? "PRESIGNED_URL_EXPIRED" : `CLOAKED_TOKEN_${String(verified.reason || "INVALID").toUpperCase()}`,
+            isExpired ? "low" : "high",
+            licenseCorsOrigins,
+            {
+                mode: parsedOuter.version === "v1e" ? "cloaked_token_encrypted" : "cloaked_token_hmac",
+                tokenJti: p?.jti || null,
+                correlationId: p?.cid || null
+            }
+        );
+    }
+
+    const payload = verified.payload;
+    const singleUse = Boolean(payload.su === 1 || payload.su === true || presignedCfg.enforceSingleUse);
+    const authMeta = {
+        mode: verified.mode,
+        tokenJti: payload.jti || null,
+        correlationId: payload.cid || null,
+        singleUse,
+        ipBound: payload.ip || null
+    };
+
+    const { segments: keySegments, hasTraversal } = normalizeAndInspectPath(payload.k);
+    if (hasTraversal || keySegments.length === 0) {
+        return rejectToken(licenseKey, gwAccessKeyReceived, license.bucket, `/${license.bucket}/_traversal`, "getObject", 400, "InvalidURI", "Invalid object key in token.", "PATH_TRAVERSAL_DETECTED", "critical", licenseCorsOrigins, authMeta);
+    }
+
+    const cleanSegments = (keySegments[0] === license.bucket && keySegments.length > 1)
+        ? keySegments.slice(1)
+        : keySegments;
+    const backendTargetPath = `/${license.bucket}/${cleanSegments.join("/")}`;
+    const tokenMethod = String(payload.m || "GET").toUpperCase();
+    const methodAllowedByToken = method === tokenMethod || (tokenMethod === "GET" && method === "HEAD");
+    const s3Operation = method === "PUT" ? "putObject" : (method === "HEAD" ? "headObject" : "getObject");
+
+    if (!methodAllowedByToken || !presignedCfg.allowedMethods.includes(method)) {
+        return rejectToken(licenseKey, gwAccessKeyReceived, license.bucket, backendTargetPath, s3Operation, 403, "AccessDenied", `HTTP method '${method}' is not permitted for this link.`, "PRESIGNED_METHOD_NOT_ALLOWED", "high", licenseCorsOrigins, authMeta);
+    }
+
+    if (payload.ip) {
+        if (!sourceIP || !ipMatchesCidrOrExact(sourceIP, payload.ip)) {
+            return rejectToken(licenseKey, gwAccessKeyReceived, license.bucket, backendTargetPath, s3Operation, 403, "AccessDenied", "Access denied: client IP does not match link binding.", "TOKEN_IP_MISMATCH", "high", licenseCorsOrigins, authMeta);
+        }
+    }
+
+    if (quarantine) {
+        return rejectToken(licenseKey, gwAccessKeyReceived, license.bucket, backendTargetPath, s3Operation, 429, "SlowDown", `S3GW Exfiltration Guard: Access key is quarantined (${quarantine.reason || "Quota exceeded"}).`, "QUARANTINED_BY_QUOTA", "high", licenseCorsOrigins, authMeta);
+    }
+
+    const secDecision = checkSecurityPolicy(env, request, url, backendTargetPath, license, s3Operation, sourceIP, country, asn, userAgent);
+    if (!secDecision.allowed) {
+        return rejectToken(licenseKey, gwAccessKeyReceived, license.bucket, backendTargetPath, s3Operation, secDecision.status || 403, secDecision.code || "AccessDenied", secDecision.message, secDecision.blockReason || "SECURITY_POLICY_VIOLATION", secDecision.riskLevel || "high", licenseCorsOrigins, authMeta);
+    }
+
+    const disableDlpKv = isDlpKvWritesDisabled(env, license);
+
+    if (singleUse && method !== "HEAD") {
+        if (!payload.jti) {
+            return rejectToken(licenseKey, gwAccessKeyReceived, license.bucket, backendTargetPath, s3Operation, 403, "AccessDenied", "Single-use policy requires a token JTI.", "MISSING_SINGLE_USE_JTI", "high", licenseCorsOrigins, authMeta);
+        }
+        const alreadyConsumed = await checkSingleUseTokenConsumed(env, licenseKey, payload.jti, disableDlpKv);
+        if (alreadyConsumed) {
+            return rejectToken(licenseKey, gwAccessKeyReceived, license.bucket, backendTargetPath, s3Operation, 403, "AccessDenied", "This single-use link has already been used.", "SINGLE_USE_TOKEN_ALREADY_CONSUMED", "high", licenseCorsOrigins, authMeta);
+        }
+    }
+
+    const backendResp = await forwardToBackend(request, url, backendTargetPath, license, env, null, {
+        stripAllQuery: true
+    });
+    const durationMs = Date.now() - startMs;
+
+    const respBytes = parseInt(backendResp.headers.get("Content-Length") || "0", 10);
+    const actualBytes = (method === "GET" || s3Operation === "getObject") ? respBytes : contentLength;
+
+    if (singleUse && method !== "HEAD" && (backendResp.ok || backendResp.status === 206 || backendResp.status === 304)) {
+        const remTtl = Math.max(60, Number(payload.exp) - Math.floor(Date.now() / 1000));
+        const markPromise = markSingleUseTokenConsumed(env, licenseKey, payload.jti, remTtl, disableDlpKv);
+        if (ctx?.waitUntil) ctx.waitUntil(markPromise);
+        else await markPromise;
+    }
+
+    if (!disableDlpKv && (backendResp.ok || backendResp.status === 206 || backendResp.status === 304)) {
+        if (ctx?.waitUntil) {
+            ctx.waitUntil(trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, method, s3Operation, actualBytes, 1));
+        }
+    }
+
+    const logEntry = buildLogEntry({
+        licenseKey,
+        gwHost: configuredGatewayHost,
+        sourceIP,
+        country,
+        city,
+        asn,
+        asOrganization,
+        userAgent,
+        gwAccessKey: gwAccessKeyReceived,
+        method,
+        s3Operation,
+        path: backendTargetPath,
+        bucket: license.bucket,
+        contentLength: actualBytes,
+        status: backendResp.status,
+        durationMs,
+        authMeta,
+        securityDecision: undefined
+    });
+    if (env.R2_GATEWAY && ctx?.waitUntil) {
+        ctx.waitUntil(writeLog(env, licenseKey, logEntry));
+    }
+
+    const respHeaders = sanitizeBackendResponseHeaders(backendResp.headers, license, {
+        fullCloak: true,
+        contentDisposition: payload.cd,
+        contentType: payload.ct
+    });
+    applyCorsHeaders(respHeaders, request, licenseCorsOrigins);
+    if (!backendResp.ok) {
+        respHeaders.set("Cache-Control", "no-transform, no-store");
+    }
+
+    return new Response(backendResp.body, {
+        status: backendResp.status,
+        statusText: backendResp.statusText,
+        headers: respHeaders,
+    });
+}
+
+function sanitizeBackendResponseHeaders(backendHeaders, license, overrides = {}) {
+    const out = new Headers(backendHeaders);
+    const shouldCloak = license?.gateway?.cloak_backend_headers !== false && license?.gateway?.cloakBackendHeaders !== false;
+    if (shouldCloak) {
+        const toDelete = [];
+        for (const [k] of out.entries()) {
+            const lower = k.toLowerCase();
+            if (overrides.fullCloak) {
+                if (CLOAKED_EXACT_HEADERS.has(lower) || CLOAKED_HEADER_PREFIXES.some(p => lower.startsWith(p))) {
+                    toDelete.push(k);
+                }
+            } else {
+                if (
+                    CLOAKED_EXACT_HEADERS.has(lower) ||
+                    lower === "x-amz-id-2" ||
+                    lower === "x-amz-request-id" ||
+                    lower.startsWith("x-scw-") ||
+                    lower.startsWith("x-ovh-") ||
+                    lower.startsWith("x-rgw-")
+                ) {
+                    toDelete.push(k);
+                }
+            }
+        }
+        for (const k of toDelete) {
+            out.delete(k);
+        }
+        out.set("Server", "s3gw");
+    }
+    if (overrides.contentDisposition) {
+        out.set("Content-Disposition", overrides.contentDisposition);
+    }
+    if (overrides.contentType) {
+        out.set("Content-Type", overrides.contentType);
+    }
+    return out;
+}
+
+function stripSigV4QueryParams(searchParams) {
+    const clean = new URLSearchParams();
+    for (const [k, v] of searchParams.entries()) {
+        if (!PRESIGN_SIGV4_QUERY_KEYS.has(k.toLowerCase())) {
+            clean.append(k, v);
+        }
+    }
+    const str = clean.toString();
+    return str ? `?${str}` : "";
+}
+
+function extractAccessKeyFromQuery(searchParams) {
+    const cred = searchParams.get("X-Amz-Credential") || searchParams.get("x-amz-credential") || "";
+    const slashIdx = cred.indexOf("/");
+    return slashIdx > 0 ? cred.slice(0, slashIdx) : "-";
+}
+
+async function verifyAwsSigV4PresignedQuery(request, gatewaySecret, url, maxTtlSeconds = DEFAULT_MAX_PRESIGN_TTL_SECONDS) {
+    try {
+        if (!gatewaySecret) return { valid: false, reason: "MissingSecret" };
+        const sp = url.searchParams;
+        const algorithm = sp.get("X-Amz-Algorithm") || sp.get("x-amz-algorithm") || "";
+        const credentialScope = sp.get("X-Amz-Credential") || sp.get("x-amz-credential") || "";
+        const amzDate = (sp.get("X-Amz-Date") || sp.get("x-amz-date") || "").trim();
+        const expiresStr = (sp.get("X-Amz-Expires") || sp.get("x-amz-expires") || "").trim();
+        const signedHeadersStr = (sp.get("X-Amz-SignedHeaders") || sp.get("x-amz-signedheaders") || "").trim();
+        const receivedSigHex = (sp.get("X-Amz-Signature") || sp.get("x-amz-signature") || "").trim().toLowerCase();
+
+        if (algorithm !== "AWS4-HMAC-SHA256" || !credentialScope || !amzDate || !expiresStr || !signedHeadersStr || !receivedSigHex) {
+            return { valid: false, reason: "MalformedPresignedQuery" };
+        }
+
+        const receivedSigBytes = hexToBytes(receivedSigHex);
+        if (!receivedSigBytes || receivedSigBytes.byteLength !== 32) {
+            return { valid: false, reason: "MalformedSignature" };
+        }
+
+        const credParts = credentialScope.split("/");
+        if (credParts.length !== 5 || credParts[4] !== "aws4_request") {
+            return { valid: false, reason: "InvalidScope" };
+        }
+
+        const dateStamp = credParts[1];
+        const region = credParts[2];
+        const service = credParts[3];
+
+        if (!/^\d{8}$/.test(dateStamp) || amzDate.slice(0, 8) !== dateStamp) {
+            return { valid: false, reason: "RequestTimeTooSkewed" };
+        }
+
+        const expiresSec = parseInt(expiresStr, 10);
+        if (isNaN(expiresSec) || expiresSec < 1 || expiresSec > maxTtlSeconds) {
+            return { valid: false, reason: "RequestTimeTooSkewed" };
+        }
+
+        const reqTimeMs = parseAmzDateMs(amzDate, null);
+        const nowMs = Date.now();
+        if (isNaN(reqTimeMs) || reqTimeMs - nowMs > MAX_SIGV4_CLOCK_SKEW_MS) {
+            return { valid: false, reason: "RequestTimeTooSkewed" };
+        }
+        if (nowMs > reqTimeMs + expiresSec * 1000) {
+            return { valid: false, reason: "RequestExpired" };
+        }
+
+        const queryForSigning = new URLSearchParams();
+        for (const [k, v] of sp.entries()) {
+            if (k.toLowerCase() !== "x-amz-signature") {
+                queryForSigning.append(k, v);
+            }
+        }
+        const canonicalQueryString = buildCanonicalQueryString(queryForSigning);
+        const signedHeaders = signedHeadersStr.split(";");
+        const scope = `${dateStamp}/${region}/${service}/aws4_request`;
+        const signingCryptoKey = await getCachedSigningCryptoKey(gatewaySecret, dateStamp, region, service);
+
+        const getNormHeader = (h) => {
+            if (h === "host") return url.host;
+            const raw = request.headers.get(h);
+            if (raw === null || raw === undefined) return "";
+            return raw.trim().replace(/\s+/g, " ");
+        };
+
+        const canPath = url.pathname.split("/").map(seg => {
+            try { return uriEncode(decodeURIComponent(seg)); } catch (e) { return uriEncode(seg); }
+        }).join("/");
+        const pathCandidates = Array.from(new Set([url.pathname, canPath]));
+        const canHeaders = signedHeaders.map(h => `${h}:${getNormHeader(h)}`).join("\n") + "\n";
+
+        for (const p of pathCandidates) {
+            const canonicalRequest = [
+                request.method,
+                p,
+                canonicalQueryString,
+                canHeaders,
+                signedHeadersStr,
+                "UNSIGNED-PAYLOAD"
+            ].join("\n");
+
+            const reqHash = await sha256Hex(canonicalRequest);
+            const stringToSign = ["AWS4-HMAC-SHA256", amzDate, scope, reqHash].join("\n");
+            const computedSigBytes = new Uint8Array(
+                await crypto.subtle.sign("HMAC", signingCryptoKey, enc(stringToSign))
+            );
+            if (timingSafeEqualBytes(computedSigBytes, receivedSigBytes)) {
+                return { valid: true };
+            }
+        }
+
+        return { valid: false, reason: "SignatureDoesNotMatch" };
+    } catch (_) {
+        return { valid: false, reason: "VerifyException" };
+    }
+}
 
 function validateCopySourceHeader(rawCopySource, allowedBucket) {
     const decoded = fullyDecodeURIComponent(String(rawCopySource || "").trim());
@@ -592,7 +1544,6 @@ function timingSafeEqualBytes(a, b) {
         try {
             return crypto.subtle.timingSafeEqual(a, b);
         } catch (_) {
-            // Fallback XOR constant-time
         }
     }
     let diff = 0;
@@ -644,7 +1595,6 @@ async function verifyAwsSigV4(request, gatewaySecret, url) {
             return { valid: false, reason: "InvalidDateStamp" };
         }
 
-        // Validation anti-rejeu (horodatage obligatoire, cohérence dateStamp et skew <= ±15 min)
         if (amzDate && amzDate.slice(0, 8) !== dateStamp) {
             return { valid: false, reason: "RequestTimeTooSkewed" };
         }
@@ -719,7 +1669,6 @@ async function verifyAwsSigV4(request, gatewaySecret, url) {
         }
 
         return { valid: false, reason: "SignatureDoesNotMatch" };
-
     } catch (e) {
         console.error("SigV4 verify error:", e.message);
         return { valid: false, reason: "VerifyException" };
@@ -734,7 +1683,6 @@ async function deriveSigningKey(secret, dateStamp, region, service) {
     return kSigning;
 }
 
-// Cache mémoire de la CryptoKey dérivée (évite 8 importKey + 8 sign WebCrypto par requête)
 async function getCachedSigningCryptoKey(secret, dateStamp, region, service) {
     const cacheKey = `${dateStamp}:${region}:${service}:${secret}`;
     const now = Date.now();
@@ -787,7 +1735,7 @@ async function sha256Hex(str) {
 
 const enc = (s) => new TextEncoder().encode(s);
 
-async function forwardToBackend(request, originalUrl, targetPath, license, env, preReadBodyBuffer = null) {
+async function forwardToBackend(request, originalUrl, targetPath, license, env, preReadBodyBuffer = null, options = {}) {
     const now = new Date();
     const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "").slice(0, 15) + "Z";
     const dateStamp = amzDate.slice(0, 8);
@@ -837,7 +1785,7 @@ async function forwardToBackend(request, originalUrl, targetPath, license, env, 
         if (!backendEndpoint.toLowerCase().startsWith(bucketName.toLowerCase() + ".")) {
             backendEndpoint = `${bucketName}.${backendEndpoint}`;
         }
-        const prefixRegex = new RegExp(`^/+${ bucketName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") }(?=/|$)`);
+        const prefixRegex = new RegExp(`^/+${bucketName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=/|$)`);
         backendPath = targetPath.replace(prefixRegex, "");
         if (!backendPath.startsWith("/")) backendPath = "/" + backendPath;
     }
@@ -845,7 +1793,11 @@ async function forwardToBackend(request, originalUrl, targetPath, license, env, 
     const backendBase = `${scheme}${backendEndpoint}`;
     const backendHost = backendEndpoint;
 
-    const backendUrl = new URL(backendPath + originalUrl.search, backendBase);
+    const effectiveQuery = options.stripAllQuery
+        ? ""
+        : (options.stripSigV4Query ? stripSigV4QueryParams(originalUrl.searchParams) : originalUrl.search);
+
+    const backendUrl = new URL(backendPath + effectiveQuery, backendBase);
 
     const cleanHeaders = new Headers(request.headers);
     cleanHeaders.delete("Authorization");
@@ -906,7 +1858,6 @@ async function forwardToBackend(request, originalUrl, targetPath, license, env, 
 
     const signedHeaderNames = Array.from(headersToSign).sort();
 
-    // Normalisation SigV4 stricte (trim + collapse des espaces multiples)
     const canonicalHeaders = signedHeaderNames
         .map(h => `${h}:${(cleanHeaders.get(h) || "").trim().replace(/\s+/g, " ")}`)
         .join("\n") + "\n";
@@ -1047,7 +1998,6 @@ function resolveS3Operation(method, path, queryString, headers = null) {
     return `${method.toLowerCase()}Unknown`;
 }
 
-// --- Parsing & Matching IP (IPv4, IPv6 canonisé, IPv4-mapped IPv6 et plages CIDR) ---
 function parseIpv4ToBigInt(ipStr) {
     const parts = ipStr.split(".");
     if (parts.length !== 4) return null;
@@ -1070,7 +2020,7 @@ function parseIpAddress(rawIp) {
 
     if (ip.includes(":")) {
         let workIp = ip.toLowerCase();
-        // Support des adresses IPv4-mapped / embedded dans IPv6 (ex: ::ffff:185.220.101.5)
+
         if (workIp.includes(".")) {
             const lastColon = workIp.lastIndexOf(":");
             const v4Part = workIp.slice(lastColon + 1);
@@ -1100,7 +2050,6 @@ function parseIpAddress(rawIp) {
             val = (val << 16n) | BigInt(parseInt(g, 16));
         }
 
-        // Si c'est une adresse IPv4-mapped (::ffff:0:0/96), on expose aussi son équivalent IPv4
         const isV4Mapped = (val >> 32n) === 0xffffn;
         return {
             version: 6,
@@ -1135,7 +2084,6 @@ function ipMatchesCidrOrExact(sourceIpStr, ruleStr) {
     const target = parseIpAddress(ipPart);
     if (!target) return false;
 
-    // Compatibilité croisée IPv4 <-> IPv4-mapped IPv6 (::ffff:a.b.c.d)
     let srcVal = src.value;
     let targetVal = target.value;
     let totalBits = target.bits;
@@ -1182,12 +2130,11 @@ function parseAsnNumber(asnVal) {
     return parseInt(cleaned, 10);
 }
 
-// Extraction du nom de fichier objet (basename) hors nom de bucket et dossiers intermédiaires
 function extractObjectBasename(normalizedPath) {
     const clean = String(normalizedPath || "").split("?")[0];
-    if (clean.endsWith("/")) return ""; // Dossier S3 : pas d'extension de fichier
+    if (clean.endsWith("/")) return "";
     const parts = clean.split("/").filter(Boolean);
-    if (parts.length <= 1) return ""; // Seulement le nom du bucket
+    if (parts.length <= 1) return "";
     return parts[parts.length - 1].toLowerCase();
 }
 
@@ -1196,7 +2143,6 @@ function checkSecurityPolicy(env, request, url, targetPath, license, s3Operation
     const envDisableStr = String(env.DISABLE_DLP_KV_WRITES || "").trim().toLowerCase();
     const auditMode = envDisableStr === "true" || envDisableStr === "1" || env.DISABLE_DLP_KV_WRITES === true || license.disable_dlp_kv_writes === true || String(license.disable_dlp_kv_writes).trim().toLowerCase() === "true";
 
-    // 0. Filtrage par User-Agent (Fail-Closed sur allowlist)
     const blockedUA = sec.blocked_user_agents || sec.blockedUserAgents || [];
     if (userAgent && blockedUA.some(ua => userAgent.toLowerCase().includes(String(ua).toLowerCase()))) {
         return { allowed: false, status: 403, code: "AccessDenied", message: "Access blocked by S3GW Security Policy (User-Agent in denylist).", blockReason: "USER_AGENT_DENYLIST", riskLevel: "high" };
@@ -1209,7 +2155,6 @@ function checkSecurityPolicy(env, request, url, targetPath, license, s3Operation
         }
     }
 
-    // 1. Filtrage par liste noire / blanche d'IP (Support IPv4, IPv6 canonisé & CIDR + Fail-Closed)
     const blockedIps = sec.blocked_ips || sec.blockedIps || [];
     if (sourceIP && isIpMatchingList(sourceIP, blockedIps)) {
         return { allowed: false, status: 403, code: "AccessDenied", message: "Access blocked by S3GW Security Policy (IP in denylist).", blockReason: "IP_DENYLIST", riskLevel: "high" };
@@ -1222,7 +2167,6 @@ function checkSecurityPolicy(env, request, url, targetPath, license, s3Operation
         }
     }
 
-    // 2. Filtrage Géographique (Pays d'origine via Cloudflare Edge, Fail-Closed sur allowlist)
     const normCountry = String(country || "Unknown").trim().toUpperCase();
     const blockedCountries = (sec.blocked_countries || sec.blockedCountries || []).map(c => String(c).trim().toUpperCase());
     if (normCountry !== "UNKNOWN" && blockedCountries.includes(normCountry)) {
@@ -1236,7 +2180,6 @@ function checkSecurityPolicy(env, request, url, targetPath, license, s3Operation
         }
     }
 
-    // 3. Filtrage ASN / ISP (Fail-Closed sur allowlist)
     const blockedAsns = (sec.blocked_asns || sec.blockedAsns || []).map(parseAsnNumber).filter(n => !isNaN(n));
     const numAsn = parseAsnNumber(asn);
     if (!isNaN(numAsn) && blockedAsns.includes(numAsn)) {
@@ -1250,7 +2193,6 @@ function checkSecurityPolicy(env, request, url, targetPath, license, s3Operation
         }
     }
 
-    // 4. Protection des opérations d'Administration (allow_admin_operations)
     const ADMIN_OPERATIONS = new Set([
         "deleteBucket", "putBucketVersioning", "putBucketLifecycle", "deleteBucketLifecycle",
         "putObjectLockConfiguration", "putBucketReplication", "deleteBucketReplication",
@@ -1268,7 +2210,6 @@ function checkSecurityPolicy(env, request, url, targetPath, license, s3Operation
         return { allowed: false, status: 403, code: "AccessDenied", message: `Administrative operation '${s3Operation}' is forbidden by S3GW security policy on this access key.`, blockReason: "ADMIN_OPERATION_FORBIDDEN_BY_GATEWAY_POLICY", riskLevel: "high" };
     }
 
-    // 5. Ransomware Killswitch & Extension Filtering sur écritures (évalué sur le basename décodé de l'objet)
     const RANSOMWARE_EXTENSIONS = [
         ".locked", ".encrypted", ".ransom", ".crypt", ".lock", ".wannacry",
         ".lockbit", ".crptr", ".crypto", ".enc", ".rnsm", ".cerber", ".locky",
@@ -1280,7 +2221,6 @@ function checkSecurityPolicy(env, request, url, targetPath, license, s3Operation
         ".yta", ".abc", ".ccc", ".vvv", ".micro", ".magic", ".exx", ".ezz", ".ecc"
     ];
 
-    // Familles non-ambiguës pouvant apparaître en avant-dernière extension (ex: file.pdf.lockbit.id123)
     const COMPOUND_RANSOMWARE_EXTS = new Set([
         ".locked", ".encrypted", ".ransom", ".wannacry", ".lockbit", ".crptr", ".rnsm",
         ".cerber", ".locky", ".cryptowall", ".zepto", ".ryuk", ".phobos", ".dharma",
@@ -1295,7 +2235,7 @@ function checkSecurityPolicy(env, request, url, targetPath, license, s3Operation
     };
 
     const customBlockedExts = (sec.blocked_extensions || sec.blockedExtensions || []).map(formatExt);
-    const killswitchActive = sec.ransomware_killswitch !== false; // Activé par défaut
+    const killswitchActive = sec.ransomware_killswitch !== false;
     const effectiveBlockedExts = killswitchActive
         ? [...RANSOMWARE_EXTENSIONS, ...customBlockedExts]
         : customBlockedExts;
@@ -1383,7 +2323,6 @@ async function incrementDlpCounter(env, counterKey, delta, ttlSeconds) {
 }
 
 async function triggerKeyQuarantine(env, licenseKey, sourceIP, quarantinePayload, quarantineDuration) {
-    // Mise en quarantaine immédiate en mémoire (0ms de fenêtre aveugle sur l'isolate)
     setQuarantineCacheImmediate(licenseKey, quarantinePayload, quarantineDuration);
     const body = JSON.stringify(quarantinePayload);
     const puts = [
@@ -1402,16 +2341,15 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, m
         if (!quotas) return;
 
         const now = new Date();
-        const ymd = now.toISOString().split("T")[0]; // YYYY-MM-DD
+        const ymd = now.toISOString().split("T")[0];
         const hour = now.getUTCHours();
         const minute = now.getUTCMinutes();
 
         const quarantineDuration = quotas.quarantine_duration_seconds || 3600;
 
-        // 1. Quota d'exfiltration en téléchargement (Bytes per hour, global sur la clé de licence)
         if ((method === "GET" || s3Operation === "getObject") && actualBytes > 0 && quotas.max_download_bytes_per_hour) {
             const hourKey = `dlp:${licenseKey}:bytes:${ymd}-${hour}`;
-            const newTotal = await incrementDlpCounter(env, hourKey, actualBytes, 7200); // TTL 2h
+            const newTotal = await incrementDlpCounter(env, hourKey, actualBytes, 7200);
 
             if (newTotal > quotas.max_download_bytes_per_hour) {
                 await triggerKeyQuarantine(env, licenseKey, sourceIP, {
@@ -1424,10 +2362,9 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, m
             }
         }
 
-        // 2. Quota de requêtes GET par minute (Anti-aspiration / scan, global sur la clé de licence)
         if ((method === "GET" || s3Operation === "getObject" || s3Operation === "listObjects") && quotas.max_get_requests_per_minute) {
             const minKey = `dlp:${licenseKey}:get:${ymd}-${hour}-${minute}`;
-            const newReqs = await incrementDlpCounter(env, minKey, 1, 300); // TTL 5m
+            const newReqs = await incrementDlpCounter(env, minKey, 1, 300);
 
             if (newReqs > quotas.max_get_requests_per_minute) {
                 await triggerKeyQuarantine(env, licenseKey, sourceIP, {
@@ -1440,11 +2377,10 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, m
             }
         }
 
-        // 3. Quota de requêtes DELETE par minute (Anti-wiper / destruction de masse : incrémente de X objets en 1 seule opération KV)
         if ((method === "DELETE" || s3Operation.includes("delete")) && quotas.max_delete_requests_per_minute) {
             const minKey = `dlp:${licenseKey}:del:${ymd}-${hour}-${minute}`;
             const incrementBy = Math.max(1, Number(deleteObjectsCount) || 1);
-            const newReqs = await incrementDlpCounter(env, minKey, incrementBy, 300); // TTL 5m
+            const newReqs = await incrementDlpCounter(env, minKey, incrementBy, 300);
 
             if (newReqs > quotas.max_delete_requests_per_minute) {
                 await triggerKeyQuarantine(env, licenseKey, sourceIP, {
@@ -1462,12 +2398,19 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, m
 }
 
 function buildLogEntry({ licenseKey, gwHost, sourceIP, country, city, asn, asOrganization, userAgent, gwAccessKey,
-    method, s3Operation, path, bucket, contentLength, status, durationMs, securityDecision }) {
-
+    method, s3Operation, path, bucket, contentLength, status, durationMs, authMeta, securityDecision }) {
     const flags = [];
     if (["deleteObject", "deleteObjects", "deleteBucket"].includes(s3Operation)) flags.push("delete_operation");
     if (["putObject", "copyObject", "uploadPart", "postObject", "createMultipartUpload", "completeMultipartUpload"].includes(s3Operation)) flags.push("write_operation");
-    if (s3Operation === "getObject") flags.push("read_operation");
+    if (s3Operation === "getObject" || s3Operation === "headObject") flags.push("read_operation");
+    if (s3Operation === "createPresignedUrl") flags.push("presign_token_minted");
+
+    if (authMeta?.mode && authMeta.mode !== "sigv4_header") {
+        flags.push("presigned_access");
+        flags.push(authMeta.mode);
+    }
+    if (authMeta?.singleUse) flags.push("single_use_token");
+    if (authMeta?.ipBound) flags.push("ip_bound_token");
 
     const ADMIN_KEYWORDS = ["Versioning", "Lifecycle", "Policy", "Cors", "Website", "Replication", "ObjectLock", "Encryption", "Logging", "Notification", "PublicAccess", "Ownership", "Acl"];
     if (ADMIN_KEYWORDS.some(kw => s3Operation.includes(kw)) || s3Operation.includes("BucketTagging")) {
@@ -1501,7 +2444,7 @@ function buildLogEntry({ licenseKey, gwHost, sourceIP, country, city, asn, asOrg
 
     const keyPath = path === `/${bucket}` ? "/" : path.replace(/^\/[^/]+\//, "/");
 
-    return {
+    const entry = {
         ts: new Date().toISOString(),
         licence: licenseKey,
         gateway: {
@@ -1513,6 +2456,7 @@ function buildLogEntry({ licenseKey, gwHost, sourceIP, country, city, asn, asOrg
             as_organization: asOrganization,
             user_agent: userAgent,
             access_key_used: gwAccessKey,
+            auth_mode: authMeta?.mode || "sigv4_header",
         },
         operation: {
             method,
@@ -1532,6 +2476,17 @@ function buildLogEntry({ licenseKey, gwHost, sourceIP, country, city, asn, asOrg
             flags,
         },
     };
+
+    if (authMeta?.tokenJti || authMeta?.correlationId || authMeta?.singleUse !== undefined || authMeta?.ipBound) {
+        entry.correlation = {
+            token_jti: authMeta.tokenJti || null,
+            correlation_id: authMeta.correlationId || null,
+            single_use: Boolean(authMeta.singleUse),
+            ip_bound: authMeta.ipBound || null,
+        };
+    }
+
+    return entry;
 }
 
 function generateRandomHex(byteLen = 3) {
@@ -1732,3 +2687,4 @@ function createAwsChunkedDecoderStream() {
         }
     });
 }
+

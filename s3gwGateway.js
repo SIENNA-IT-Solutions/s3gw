@@ -30,7 +30,7 @@ const MAX_SIGV4_CLOCK_SKEW_MS = 15 * 60 * 1000;
 const DEFAULT_PRESIGN_TTL_SECONDS = 900;
 const DEFAULT_MAX_PRESIGN_TTL_SECONDS = 86400;
 
-const ACCESS_KEY_FORMAT_REGEX = /^[A-Za-z0-9_.-]{8,128}$/;
+const ACCESS_KEY_FORMAT_REGEX = /^[A-Za-z0-9_.\-!#^&*@$%~+=]{8,128}$/;
 
 const PRESIGN_SIGV4_QUERY_KEYS = new Set([
     "x-amz-algorithm",
@@ -2503,7 +2503,7 @@ async function writeLog(env, licenseKey, logEntry) {
         const month = String(now.getUTCMonth() + 1).padStart(2, "0");
         const day = String(now.getUTCDate()).padStart(2, "0");
         const ts = now.getTime();
-        const safePrefix = String(licenseKey || "_unauthenticated").replace(/[^A-Za-z0-9_.-]/g, "_");
+        const safePrefix = String(licenseKey || "_unauthenticated").replace(/[\/\\]/g, "_");
         const shortKey = safePrefix.substring(0, 8);
         const randSuffix = generateRandomHex(3);
 

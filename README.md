@@ -1,4 +1,4 @@
-# S3GW — Universal Cloudflare Edge S3 Firewall & IPS Proxy
+# S3GW — Universal Cloudflare Edge S3 Firewall, IPS & Cloaking Proxy
 
 [![Website](https://img.shields.io/badge/Website-s3gw.com-F0B429?labelColor=171310&style=flat-square)](https://s3gw.com)
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-F0B429?labelColor=171310&style=flat-square)](./LICENSE)
@@ -6,123 +6,86 @@
 [![Built by SIENNA](https://img.shields.io/badge/Built%20by-SIENNA%20IT%20Solutions-F0B429?labelColor=171310&style=flat-square)](https://sienna.dev)
 [![tamper Module](https://img.shields.io/badge/Core%20Module%20for-tamper-F0B429?labelColor=171310&style=flat-square)](https://tamper.fr)
 
-**S3GW** is an open-source, free, On-Prem/DIY cybersecurity product explicitly designed for **Developers, DevSecOps, and DevOps**. Executing with **0ms sequential overhead** on Cloudflare Workers, S3GW acts as a transparent reverse-proxy and Active Threat Firewall for the S3 protocol.
+**S3GW** is an open-source, On-Prem/DIY cybersecurity gateway built for **DevOps, DevSecOps, Cloud Engineers, and SOC teams**. Running at the Cloudflare Edge with **<5ms overhead**, S3GW acts as a transparent S3 reverse-proxy, an inline Threat Firewall (IPS), a Zero-Exposure Presigned URL Cloaking Engine, and a real-time SIEM audit logger.
 
-Whether your buckets are hosted on **AWS S3, Cloudflare R2, Scaleway, Hetzner, OVHcloud, Wasabi, or Backblaze B2**, S3GW provides real-time access control, behavioral threat blocking, data exfiltration quotas, and enriched JSON audit logging—**without requiring any modifications to your S3 client SDKs or applications**.
-
----
-
-## Why S3GW for DevSecOps?
-
-Legacy S3 buckets are vulnerable to **stolen access keys**, **overnight data exfiltration**, **ransomware encryption**, and **mass deletion (wipers)**. Native IAM policies are complex, provider-dependent, and lack instant edge geo-blocking or volumetric rate limits.
-
-S3GW empowers Developers and DevSecOps teams to build their own Zero-Trust perimeter:
-- **DIY & On-Prem (Cloudflare Edge):** Run it inside your own Cloudflare account. Your credentials and audit logs never leave your infrastructure.
-- **Provider Agnostic:** Secure AWS, R2, or any S3-compatible storage with a unified, code-driven configuration.
-- **Zero Egress Latency:** Asynchronous logging (`ctx.waitUntil`) and parallel KV caching (`Promise.all`) ensure zero performance degradation.
+Whether you manage 1 or 100 buckets across **AWS S3, Cloudflare R2, Scaleway, OVHcloud, Leviia, Wasabi, Hetzner, or Backblaze B2**, a **single S3GW Worker** routes, inspects, and translates every request using isolated per-bucket KV policies—**without exposing your real S3 endpoints, bucket names, or cloud IAM keys**.
 
 ---
 
-## Key Features & The 2 Pillars of Active Cyber Defense
+## Core Architecture: 1 Worker, $N$ Buckets, Multi-Cloud Isolation
 
-### Pillar 1: Active Threat Blocking & Security Policy Engine (Inline IPS/WAF)
-Every access key can be hardened with precise behavioral restrictions enforced at the Edge:
-- **Strict Target Bucket Validation:** Mismatches trigger an instant 403.
-- **Geo-Blocking & ASN Reputation:** Whitelist/Denylist specific countries, ISPs, or Autonomous Systems (`blocked_asns`).
-- **IP Denylists / Whitelists:** Instantly drop traffic from suspicious IPs.
-- **User-Agent Filtering:** Allow or block specific client tools.
-- **Ransomware Extension Killswitch (`PUT` Inspection):** Automatically detects and drops file uploads with known ransomware extensions (LockBit, Conti, BlackCat, etc.). Supports custom extensions.
-- **Administrative Operation Prohibition:** Block bucket-destroying operations (e.g., `deleteBucket`, lifecycle changes, versioning suspension) even if the underlying cloud API key has admin privileges (`allow_admin_operations: false`).
-
-### Pillar 2: Data Exfiltration Prevention (DLP Volumetric Quotas & Auto-Quarantine)
-Defend against stolen logic access keys:
-- **Hourly Download Volumetric Quota:** Set exact byte limits (`max_download_bytes_per_hour`).
-- **Rate Limiting (`GET` & `DELETE`):** Prevent automated scraping or mass deletion (`max_get_requests_per_minute`, `max_delete_requests_per_minute`).
-- **Ephemeral KV Quarantine (`Auto-Cleaning`):** When a threshold is exceeded, S3GW automatically places the key in quarantine with a TTL. The gateway immediately returns an HTTP 429 `SlowDown` until the TTL expires—no cron jobs required.
-
----
-
-## Enriched SIEM JSON Audit Logging & Correlation
-
-Every single request is asynchronously recorded as an immutable JSON audit file into a Cloudflare R2 bucket (`R2_GATEWAY`). 
-These enriched logs are specifically designed to **feed your SIEM, SOC, and other cybersecurity solutions for advanced event correlation** (Splunk, Sentinel, Datadog, Wazuh, etc.).
-
-**Directory Partitioning Structure in R2:**
-```text
-[licenseKey]/YYYY/MM/DD/log[8chars][timestamp].json
 ```
-
-### Example Log Entry (Ingestion-Ready for Splunk, Datadog, or Elastic Security):
-
-**[Example: PUT Operation - File Upload]**
-```json
-{
-  "ts": "2026-07-04T19:45:12.304Z",
-  "licence": "DEMO_S3GW_KEY",
-  "gateway": {
-    "host": "s3gw.yourdomain.com",
-    "ip": "81.252.14.99",
-    "country": "FR",
-    "city": "Paris",
-    "asn": "AS3215",
-    "as_organization": "Orange SA",
-    "user_agent": "aws-cli/2.15.0 Python/3.11.6 Linux/5.10.0-8-amd64",
-    "access_key_used": "DEMO_S3GW_KEY"
-  },
-  "operation": {
-    "method": "PUT",
-    "type": "putObject",
-    "bucket": "my-target-bucket",
-    "key": "/reports/2026_Q3_financial_audit.pdf"
-  },
-  "response": {
-    "status": 200,
-    "bytes": 4582910,
-    "duration_ms": 142
-  },
-  "security": {
-    "action": "allowed",
-    "risk_level": "medium",
-    "block_reason": null,
-    "flags": [
-      "write_operation"
-    ]
-  }
-}
+[ S3 SDK / CLI / Terraform / Browser ]
+                 │
+                 ▼  (Virtual Gateway Keys OR Cloaked /dl/<token> Link)
+     ┌───────────────────────┐
+     │   S3GW Edge Worker    │ ◄─── Cloudflare KV (1 Entry per Bucket)
+     │  • SigV4 & AES-256    │      • Virtual Keys <-> Real Provider Keys
+     │  • Geo/ASN/IP/UA IPS  │      • Ransomware Killswitch & Admin Lock
+     │  • DLP Quotas & Guard │      • Presigned URL Policy & Single-Use
+     └──────────┬────────────┘
+                ├──────────────────► R2 SIEM Audit Bucket (Async JSON Logs)
+                ▼
+[ AWS S3 | Scaleway | OVH | R2 | Wasabi | Leviia ] (100% Private & Cloaked)
 ```
 
 ---
 
-## 5-Minute Deployment Guide on Cloudflare Workers
+## The 3 Pillars of Active S3 Cyber Defense
 
-### 1. Prerequisites
-- A Cloudflare account with Workers, KV, and R2 enabled.
-- Node.js and [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/) installed (`npm install -g wrangler`).
+### Pillar 1: Inline S3 Firewall & IPS (Zero-Trust Perimeter)
+Every virtual access key is hardened at the Edge before traffic ever reaches your storage provider:
+- **Strict Bucket & Copy-Source Isolation:** Blocks unauthorized bucket access and cross-bucket `x-amz-copy-source` exfiltration attempts.
+- **Recursive Path Normalization:** Decodes multi-pass URI encodings (`%252e%252e`) to block path traversal attacks (`400 InvalidURI`).
+- **IPv4 / IPv6 & CIDR Filtering:** Full support for IPv4, canonicalized IPv6, IPv4-mapped IPv6 (`::ffff:0:0/96`), and CIDR ranges.
+- **Geo-Fencing & ASN Reputation:** Allowlist or denylist countries (`FR`, `DE`) and Autonomous Systems (`blocked_asns`).
+- **Ransomware Extension Killswitch (`PUT` / `POST` Inspection):** Inspects single and multipart uploads to block 55+ known ransomware extensions (`.lockbit`, `.blackcat`, `.encrypted`, compound extensions like `report.pdf.lockbit.id123`) plus custom extension allow/denylists.
+- **Administrative Operation Lock (`allow_admin_operations: false`):** Prevents bucket deletion, policy/ACL tampering, lifecycle modification, or versioning suspension even if the backend S3 key has full permissions.
+- **Streaming `aws-chunked` Decoder & GUI Compatibility:** Natively decodes `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` and serves synthetic `ListAllMyBucketsResult` on `GET /` so Cyberduck, S3 Browser, WinSCP, Veeam, and rclone work out-of-the-box.
 
-### 2. Create Resources & Clone Repository
+### Pillar 2: Zero-Exposure Cloaked Presigned URLs (`/dl/` & `/s/`)
+Standard S3 presigned URLs leak your cloud provider (`amazonaws.com`), your region, your internal bucket name, and your object hierarchy, and **cannot be revoked** once issued. S3GW replaces them with **Cloaked Presigned URLs**:
+- **AES-256-GCM Encrypted Tokens (`v1e.`):** Mint temporary download/upload links (`https://gateway.domain.tld/dl/v1e...`) where the object key, expiration, and metadata are encrypted with WebCrypto `AES-256-GCM`. Even base64 decoding reveals zero internal paths or bucket names.
+- **Stateless HMAC Tokens (`v1.`):** Generate signed links locally in 0ms from any microservice, Python script, or Ansible playbook without calling the gateway.
+- **Standard AWS SigV4 Query Support (`?X-Amz-Signature=...`):** Drop-in compatibility with `aws s3 presign` and `boto3` presigned URLs (supports `/_/path/to/object` alias to hide the bucket name).
+- **Single-Use Links (`single_use: true`):** Automatically invalidates the link after the first successful download (`200`/`206`), blocking replay or link-sharing abuse (`403 SINGLE_USE_TOKEN_ALREADY_CONSUMED`).
+- **Client IP / CIDR Binding (`ip_bind`):** Cryptographically locks a presigned link to the recipient's IP or subnet (`403 TOKEN_IP_MISMATCH`).
+- **Response Header Cloaking (`cloak_backend_headers: true`):** Strips provider-identifying headers (`x-amz-request-id`, `x-amz-id-2`, `x-scw-*`, `x-ovh-*`, `Server: AmazonS3`) and replaces them with `Server: s3gw`.
+
+### Pillar 3: DLP Volumetric Quotas & Auto-Quarantine
+- **Hourly Exfiltration Cap (`max_download_bytes_per_hour`):** Stops mass data theft in real time.
+- **Anti-Scraping & Anti-Wiper Rate Limits:** Enforces `max_get_requests_per_minute` and batch-aware `max_delete_requests_per_minute` (parses XML `<Object>` count inside `POST ?delete` batches before forwarding).
+- **Instant Isolate + KV Quarantine:** Exceeding any threshold triggers an immediate `429 SlowDown` quarantine across both the isolate LRU memory cache (0ms blind window) and Cloudflare KV (`quarantine:<key>` and `quarantine:<key>:<ip>`).
+
+---
+
+## DevOps & DevSecOps How-To Guide
+
+### Step 1: Deploy the Worker (5 Minutes)
+
 ```bash
-# Create KV Namespace for licenses & quotas
+# 1. Create the KV namespace (stores bucket licenses & optional DLP counters)
 wrangler kv namespace create LICENSES_KV
 
-# Create R2 Bucket for real-time audit logs
+# 2. Create the R2 bucket (stores immutable JSON SIEM audit logs)
 wrangler r2 bucket create s3gw-audit-logs
-```
 
-```bash
-git clone https://github.com/SIENNA-IT-Solutions/s3gw.git
-cd s3gw
+# 3. Configure wrangler.toml
 cp wrangler.toml.example wrangler.toml
 ```
 
-Edit `wrangler.toml` with the IDs generated above:
+Edit `wrangler.toml`:
 ```toml
 name = "s3gw-firewall"
 main = "s3gwGateway.js"
 compatibility_date = "2026-07-11"
 
 [vars]
-GATEWAY_HOST = "s3gw.yourdomain.com" # Your Cloudflare Worker domain binding
-# DISABLE_DLP_KV_WRITES = "true" # Audit/SaaS Mode (disables DLP KV writes)
+GATEWAY_HOST = "gateway.yourdomain.com"
+# Optional: set to "true" for Zero-KV-Write mode (disables DLP KV writes)
+DISABLE_DLP_KV_WRITES = "false"
+# Optional: global CORS origins fallback
+CORS_ALLOWED_ORIGINS = ""
 
 [[kv_namespaces]]
 binding = "LICENSES_KV"
@@ -133,41 +96,57 @@ binding = "R2_GATEWAY"
 bucket_name = "s3gw-audit-logs"
 ```
 
-> [!TIP]
-> **Audit-Only Mode (Save KV Costs & Avoid False Positives)**
-> By setting `DISABLE_DLP_KV_WRITES = "true"`, the gateway enters **Audit-Only Mode**. It enforces Blocklists (IPs, Countries, User-Agents, ASNs, Ransomware Killswitch) but skips DLP Quota KV writes and ignores Allowlists. Perfect for a safe, low-cost baseline.
-
-### 3. Deploy to Cloudflare Edge
+Deploy to Cloudflare Edge:
 ```bash
 wrangler deploy
 ```
 
-### 4. Client License Configuration (KV Namespace)
+---
 
-In your `LICENSES_KV` namespace, create a new key where the **Key Name** is your client's logic access key (e.g., `DEMO_S3GW_KEY`), and the **Value** is a JSON configuration like this example:
+### Step 2: Provision Bucket Licenses in KV (1 KV Entry = 1 Bucket)
 
+In `LICENSES_KV`, each bucket is configured as a JSON document where the **KV Key** is the virtual `gateway.access_key` (e.g., `GW_MR_PROD_01`). Lookups are cached in a bounded in-memory LRU cache (`60s` TTL) for near-zero latency.
+
+Save `s3gwLicence.json`:
 ```json
 {
   "activated": true,
-  "expires_at": "2030-12-31T23:59:59Z",
+  "expires_at": "2099-12-31T23:59:59Z",
+  "bucket": "mr-labels-internal-prod",
   "gateway": {
     "enabled": true,
-    "access_key": "DEMO_S3GW_KEY",
-    "secret_key": "YOUR_GATEWAY_SECRET_KEY"
+    "access_key": "GW_MR_PROD_01",
+    "secret_key": "YOUR_GATEWAY_VIRTUAL_SECRET_KEY",
+    "cloak_backend_headers": true,
+    "presigned_urls": {
+      "enabled": true,
+      "allow_encrypted_tokens": true,
+      "allow_hmac_tokens": true,
+      "allow_sigv4_query": true,
+      "allow_bearer_minting": true,
+      "default_ttl_seconds": 900,
+      "max_ttl_seconds": 86400,
+      "enforce_single_use": false,
+      "allowed_methods": ["GET", "HEAD"]
+    }
   },
-  "bucket": "my-target-bucket",
+  "accessKey": "AKIA_REAL_PROVIDER_ACCESS_KEY",
+  "secretKey": "REAL_PROVIDER_SECRET_KEY",
   "endpoint": "s3.eu-west-3.amazonaws.com",
   "region": "eu-west-3",
-  "accessKey": "AKIAX_REAL_S3_ACCESS_KEY",
-  "secretKey": "REAL_S3_SECRET_KEY_abc123",
   "forceVirtualHost": true,
   "forcePathStyle": false,
   "security_policy": {
-    "allowed_countries": ["FR", "DE", "BE", "CH", "US"],
+    "allowed_countries": ["FR", "BE", "DE", "CH"],
     "blocked_countries": ["RU", "CN", "KP", "IR"],
-    "blocked_asns": [4134, 4837, 3462],
     "allowed_ips": [],
-    "blocked_ips": ["185.220.101.5"],
+    "blocked_ips": ["185.220.101.0/24"],
+    "allowed_asns": [],
+    "blocked_asns": [4134, 4837],
+    "allowed_user_agents": [],
+    "blocked_user_agents": ["sqlmap", "nikto"],
+    "allowed_extensions": [],
+    "blocked_extensions": [".exe", ".sh"],
     "allow_admin_operations": false,
     "ransomware_killswitch": true,
     "dlp_quotas": {
@@ -180,32 +159,155 @@ In your `LICENSES_KV` namespace, create a new key where the **Key Name** is your
 }
 ```
 
-Now, point any S3 tool (AWS CLI, Cyberduck, Veeam, Terraform) to `https://s3gw.yourdomain.com/my-target-bucket` using `DEMO_S3GW_KEY` as Access Key and its associated `secret_key`!
+Push the license to Cloudflare KV via Wrangler CLI:
+```bash
+wrangler kv key put --binding=LICENSES_KV "GW_MR_PROD_01" --path=s3gwLicence.json
+```
+
+> [!TIP]
+> **Zero-KV-Write Mode (for High-Throughput DAM & tamper Integration)**
+> To run S3GW with **zero KV writes** (100% read-only on KV), set `"dlp_quotas": false` (or `"disable_dlp_kv_writes": true` in the license JSON, or `DISABLE_DLP_KV_WRITES = "true"` in `wrangler.toml`). All inline IPS rules (GeoIP, IP/CIDR allow/denylists, ASN, User-Agent, Ransomware Killswitch, Admin Lock) and R2 SIEM logging remain 100% active without generating a single KV write operation.
 
 ---
 
-## The Bridge to tamper — Deep S3 Object Security & FIM
+### Step 3: How to Use S3GW in Your Workflows
 
-S3GW natively integrates with **[tamper](https://tamper.fr)**. Connect your S3GW audit buckets to tamper to unlock instant visual dashboards, real-time SOC alerts, and automated deep-object verification (FIM) across all your clouds.
+#### A. Standard S3 CLI, SDKs, Terraform & Backup Tools
+Configure your S3 client to use `https://gateway.yourdomain.com` with your virtual `gateway.access_key` and `gateway.secret_key`:
+
+```bash
+export AWS_ACCESS_KEY_ID="GW_MR_PROD_01"
+export AWS_SECRET_ACCESS_KEY="YOUR_GATEWAY_VIRTUAL_SECRET_KEY"
+export AWS_DEFAULT_REGION="eu-west-3"
+
+# Upload an object through the S3GW Firewall
+aws s3 cp ./shipping-label-994812.pdf s3://mr-labels-internal-prod/bordereaux/2026/colis-994812.pdf \
+  --endpoint-url https://gateway.yourdomain.com
+```
+
+#### B. Minting Zero-Exposure Cloaked Presigned Links (`POST /_s3gw/presign`)
+Instead of exposing direct S3 presigned URLs to customers (e.g., e-commerce invoices, parcel shipping labels, confidential reports), call `POST /_s3gw/presign` using either `Authorization: Bearer <access_key>:<secret_key>` or AWS SigV4:
+
+```bash
+curl -s -X POST https://gateway.yourdomain.com/_s3gw/presign \
+  -H "Authorization: Bearer GW_MR_PROD_01:YOUR_GATEWAY_VIRTUAL_SECRET_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "key": "bordereaux/2026/colis-994812.pdf",
+    "expires_in": 900,
+    "single_use": true,
+    "ip_bind": "203.0.113.0/24",
+    "filename": "bon-envoi-994812.pdf",
+    "correlation_id": "lbc-order-994812",
+    "mode": "encrypted"
+  }'
+```
+
+**Response:**
+```json
+{
+  "url": "https://gateway.yourdomain.com/dl/v1e.R1dfTVJfUFJPRF8wMQ.XGY6l8AAFY1iPxLaZnzQ...",
+  "token": "v1e.R1dfTVJfUFJPRF8wMQ.XGY6l8AAFY1iPxLaZnzQ...",
+  "mode": "encrypted",
+  "method": "GET",
+  "expires_in": 900,
+  "expires_at": "2026-11-03T17:17:28.000Z",
+  "single_use": true,
+  "ip_bind": "203.0.113.0/24",
+  "jti": "a7120e9545c28dc6",
+  "correlation_id": "lbc-order-994812"
+}
+```
+
+When the end-user opens `https://gateway.yourdomain.com/dl/v1e...` in their browser or via `curl`:
+1. S3GW decrypts the `AES-256-GCM` token and verifies expiration, IP binding, single-use status, and security policies.
+2. S3GW signs a real S3 `GET` request to `mr-labels-internal-prod.s3.eu-west-3.amazonaws.com` on the fly.
+3. S3GW strips all AWS headers (`x-amz-*`, `Server: AmazonS3`) and streams the PDF with `Content-Disposition: attachment; filename="bon-envoi-994812.pdf"`.
+
+#### C. Offline / Local Stateless Token Generation (Python / Ansible / CI)
+Need to generate millions of links locally without an HTTP call to `/_s3gw/presign`? Use `v1` HMAC tokens in 10 lines of Python:
+
+```python
+import hmac, hashlib, json, time, base64, secrets
+
+def b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+def generate_offline_s3gw_url(gateway_url: str, access_key: str, secret_key: str, object_key: str, ttl: int = 900, correlation_id: str = None):
+    now = int(time.time())
+    payload = {"k": object_key, "m": "GET", "iat": now, "exp": now + ttl, "jti": secrets.token_hex(8)}
+    if correlation_id:
+        payload["cid"] = correlation_id
+    ak_b64 = b64u(access_key.encode())
+    pl_b64 = b64u(json.dumps(payload, separators=(",", ":")).encode())
+    signing_input = f"v1.{ak_b64}.{pl_b64}".encode()
+    derived_key = hmac.new(b"S3GW_CLOAK_HMAC_V1", secret_key.encode(), hashlib.sha256).digest()
+    sig_b64 = b64u(hmac.new(derived_key, signing_input, hashlib.sha256).digest())
+    return f"{gateway_url.rstrip('/')}/dl/v1.{ak_b64}.{pl_b64}.{sig_b64}"
+```
 
 ---
 
-## Contributing & Open-Source Community
+## Enriched SIEM JSON Audit Logging & SOC Correlation
 
-We love open-source! If you find **S3GW** useful:
-1. **Star this repository** to support our research in open-source cloud security.
-2. **Fork & Build:** Feel free to create your own implementation or port the S3GW logic to your favorite language.
-3. **Submit PRs:** Found a bug or want to add new DLP detection rules? Pull requests are warmly welcomed!
+Every request (API call, presigned token mint, cloaked download, or blocked attack) is asynchronously written to R2 (`[licenseKey]/YYYY/MM/DD/log[8chars][ts]_[rand].json`):
+
+```json
+{
+  "ts": "2026-11-03T17:02:25.104Z",
+  "licence": "GW_MR_PROD_01",
+  "gateway": {
+    "host": "gateway.yourdomain.com",
+    "ip": "203.0.113.42",
+    "country": "FR",
+    "city": "Paris",
+    "asn": 3215,
+    "as_organization": "Orange SA",
+    "user_agent": "Mozilla/5.0",
+    "access_key_used": "GW_MR_PROD_01",
+    "auth_mode": "cloaked_token_encrypted"
+  },
+  "operation": {
+    "method": "GET",
+    "type": "getObject",
+    "bucket": "mr-labels-internal-prod",
+    "key": "/bordereaux/2026/colis-994812.pdf"
+  },
+  "response": {
+    "status": 200,
+    "bytes": 148920,
+    "duration_ms": 38
+  },
+  "security": {
+    "action": "allowed",
+    "risk_level": "info",
+    "block_reason": null,
+    "flags": [
+      "read_operation",
+      "presigned_access",
+      "cloaked_token_encrypted",
+      "single_use_token",
+      "ip_bound_token"
+    ]
+  },
+  "correlation": {
+    "token_jti": "a7120e9545c28dc6",
+    "correlation_id": "lbc-order-994812",
+    "single_use": true,
+    "ip_bound": "203.0.113.0/24"
+  }
+}
+```
+
+---
+
+## Native Integration with tamper (FIM + DSPM + DAM + DLP)
+
+S3GW is the edge engine powering **[tamper](https://tamper.fr)**'s Data Access Monitoring (DAM). Connect your `R2_GATEWAY` bucket to tamper to correlate real-time S3 access logs (`who`, `when`, `from where`, `correlation_id`) with File Integrity Monitoring (FIM) and AI-powered DLP content inspection.
 
 ---
 
 ## License & Credits
 
-Developed by **[SIENNA](https://sienna.dev)** (the team behind [tamper](https://tamper.fr)).
-
-Released under the **[Business Source License 1.1 (BSL)](./LICENSE)**.
-> **What does this mean for you?**
-> S3GW is a free, open-source tool for **Developers, DevSecOps, and DevOps**. You are entirely free to use, run, and modify this code for your own internal infrastructure (`DIY` / `On-Prem`). However, you **cannot** take this code and offer it as a competing commercial SaaS or sell it as a commercial product.
-> If you wish to use S3GW as part of a commercial product, please contact SIENNA for licensing options.
-
----
+Developed by **[SIENNA](https://sienna.dev)** (creators of [tamper](https://tamper.fr)).
+Released under the **[Business Source License 1.1 (BSL)](./LICENSE)** — free for internal On-Prem/DIY infrastructure usage by Developers, DevOps, and DevSecOps teams.

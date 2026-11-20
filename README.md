@@ -15,7 +15,7 @@ Whether you manage 1 or 100 buckets across **AWS S3, Cloudflare R2, Scaleway, OV
 ## Core Architecture: 1 Worker, $N$ Buckets, Multi-Cloud Isolation
 
 ```
-[ S3 SDK / CLI / Terraform / Browser ]
+[ S3 SDK / CLI / Terraform / AI Agents (LangChain, MCP, boto3) / Browser ]
                  │
                  ▼  (Virtual Gateway Keys OR Cloaked /dl/<token> Link)
      ┌───────────────────────┐
@@ -23,15 +23,18 @@ Whether you manage 1 or 100 buckets across **AWS S3, Cloudflare R2, Scaleway, OV
      │  • SigV4 & AES-256    │      • Virtual Keys <-> Real Provider Keys
      │  • Geo/ASN/IP/UA IPS  │      • Ransomware Killswitch & Admin Lock
      │  • DLP Quotas & Guard │      • Presigned URL Policy & Single-Use
+     │  • AI Telemetry &     │      • Canary Tripwires & Webhook Alerts
+     │    Canary Tripwires   │
      └──────────┬────────────┘
                 ├──────────────────► R2 SIEM Audit Bucket (Async JSON Logs)
+                ├──────────────────► Real-Time SOC Webhook Alerts (Canary / Ransomware / DLP)
                 ▼
 [ AWS S3 | Scaleway | OVH | R2 | Wasabi | Leviia ] (100% Private & Cloaked)
 ```
 
 ---
 
-## The 3 Pillars of Active S3 Cyber Defense
+## The 4 Pillars of Active S3 Cyber Defense
 
 ### Pillar 1: Inline S3 Firewall & IPS (Zero-Trust Perimeter)
 Every virtual access key is hardened at the Edge before traffic ever reaches your storage provider:
@@ -50,12 +53,22 @@ Standard S3 presigned URLs leak your cloud provider (`amazonaws.com`), your regi
 - **Standard AWS SigV4 Query Support (`?X-Amz-Signature=...`):** Drop-in compatibility with `aws s3 presign` and `boto3` presigned URLs (supports `/_/path/to/object` alias to hide the bucket name).
 - **Single-Use Links (`single_use: true`):** Automatically invalidates the link after the first successful download (`200`/`206`), blocking replay or link-sharing abuse (`403 SINGLE_USE_TOKEN_ALREADY_CONSUMED`).
 - **Client IP / CIDR Binding (`ip_bind`):** Cryptographically locks a presigned link to the recipient's IP or subnet (`403 TOKEN_IP_MISMATCH`).
-- **Response Header Cloaking (`cloak_backend_headers: true`):** Strips provider-identifying headers (`x-amz-request-id`, `x-amz-id-2`, `x-scw-*`, `x-ovh-*`, `Server: AmazonS3`) and replaces them with `Server: s3gw`.
+- **Response Header Cloaking (`cloak_backend_headers: true`):** Strips provider-identifying headers (`x-amz-request-id`, `x-amz-id-2`, `x-amz-bucket-region`, `x-scw-*`, `x-ovh-*`, `Server: AmazonS3`) and replaces them with `Server: s3gw`.
 
 ### Pillar 3: DLP Volumetric Quotas & Auto-Quarantine
 - **Hourly Exfiltration Cap (`max_download_bytes_per_hour`):** Stops mass data theft in real time.
 - **Anti-Scraping & Anti-Wiper Rate Limits:** Enforces `max_get_requests_per_minute` and batch-aware `max_delete_requests_per_minute` (parses XML `<Object>` count inside `POST ?delete` batches before forwarding).
 - **Instant Isolate + KV Quarantine:** Exceeding any threshold triggers an immediate `429 SlowDown` quarantine across both the isolate LRU memory cache (0ms blind window) and Cloudflare KV (`quarantine:<key>` and `quarantine:<key>:<ip>`).
+
+### Pillar 4: AI Agents & LLM Zero-Trust Guardrails (Canary Traps & Webhook Alerting)
+Built as a **Zero-Trust Storage Gateway for Autonomous AI Agents** (LangChain, LlamaIndex, CrewAI, AutoGen, MCP S3 connectors, or plain `boto3` scripts) with **zero SDK friction**:
+- **Zero Master IAM Exposure:** AI agents authenticate using virtual gateway credentials; real AWS/Scaleway/OVH/R2 keys never enter agent prompts, sandboxes, or runtime memory, and can be revoked in 1ms.
+- **Agent & Workflow Attribution Headers (Optional, Non-Blocking):** Clients and orchestration frameworks can attach `X-Agent-ID`, `X-Workflow-ID`, and `X-Session-ID` headers to attribute every S3 read/write/delete in the R2 audit trail (`ai_context`), while `User-Agent` and full `listObjects` `prefix`/`delimiter` exploration paths are always recorded.
+- **Stealth Canary Tripwires (`canary_paths`):** Configure honeypot object paths (exact keys or `folder/*` wildcards) inside `security_policy.canary_paths`. Any `GET`, `DELETE`, or batch `deleteObjects` touching a canary passes through stealthily (no warning returned to the caller), logs with `risk_level: "critical"` + `flag: "canary_tripped"`, and triggers an immediate webhook alert.
+- **Real-Time SOC Webhook Alerting (`alerting.webhook_url` / `ALERT_WEBHOOK_URL`):** Sends structured plain-text + JSON incident alerts (compatible with PagerDuty, Slack, Teams, ntfy, or custom SIEM webhooks) on **3 critical events**:
+  1. `s3gw.security.canary_tripped` — Stealth canary honeypot accessed (`GET`/`DELETE`).
+  2. `s3gw.security.ransomware_killswitch_triggered` — Ransomware extension upload blocked at the Edge (`403`).
+  3. `s3gw.security.dlp_quarantine_triggered` — Mass exfiltration, scraping loop, or mass-delete quota exceeded (`429` quarantine activated).
 
 ---
 
@@ -86,6 +99,8 @@ GATEWAY_HOST = "gateway.yourdomain.com"
 DISABLE_DLP_KV_WRITES = "false"
 # Optional: global CORS origins fallback
 CORS_ALLOWED_ORIGINS = ""
+# Optional: global SOC webhook fallback (can also be overridden per-bucket in KV security_policy.alerting.webhook_url)
+ALERT_WEBHOOK_URL = ""
 
 [[kv_namespaces]]
 binding = "LICENSES_KV"
@@ -149,7 +164,15 @@ Save `s3gwLicence.json`:
     "blocked_extensions": [".exe", ".sh"],
     "allow_admin_operations": false,
     "ransomware_killswitch": true,
+    "canary_paths": [
+      "finance/2026/payroll_master_confidential.xlsx",
+      "secrets/*"
+    ],
+    "alerting": {
+      "webhook_url": "https://your-webhook-endpoint.example.com/s3gw-alerts"
+    },
     "dlp_quotas": {
+      "enabled": true,
       "max_download_bytes_per_hour": 10737418240,
       "max_get_requests_per_minute": 600,
       "max_delete_requests_per_minute": 60,
@@ -246,6 +269,28 @@ def generate_offline_s3gw_url(gateway_url: str, access_key: str, secret_key: str
     return f"{gateway_url.rstrip('/')}/dl/v1.{ak_b64}.{pl_b64}.{sig_b64}"
 ```
 
+#### D. AI Agent Integration (`boto3` / LangChain / MCP) with Optional Attribution Headers
+Point any AI agent or RAG pipeline to `https://gateway.yourdomain.com` with zero SDK changes. Optionally attach `X-Agent-ID`, `X-Workflow-ID`, and `X-Session-ID` for per-agent audit attribution:
+
+```python
+import boto3
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="https://gateway.yourdomain.com",
+    aws_access_key_id="GW_MR_PROD_01",
+    aws_secret_access_key="YOUR_GATEWAY_VIRTUAL_SECRET_KEY",
+    region_name="eu-west-3",
+)
+
+def inject_ai_headers(request, **kwargs):
+    request.headers["X-Agent-ID"] = "rag-analyst-01"
+    request.headers["X-Workflow-ID"] = "wf-quarterly-audit"
+    request.headers["X-Session-ID"] = "sess-9f3a2c"
+
+s3.meta.events.register("before-sign.s3.*", inject_ai_headers)
+```
+
 ---
 
 ## Enriched SIEM JSON Audit Logging & SOC Correlation
@@ -289,6 +334,11 @@ Every request (API call, presigned token mint, cloaked download, or blocked atta
       "single_use_token",
       "ip_bound_token"
     ]
+  },
+  "ai_context": {
+    "agent_id": "rag-analyst-01",
+    "workflow_id": "wf-quarterly-audit",
+    "session_id": "sess-9f3a2c"
   },
   "correlation": {
     "token_jti": "a7120e9545c28dc6",

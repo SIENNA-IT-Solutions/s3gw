@@ -8,6 +8,9 @@ const LOGGABLE_POST_ACTIONS = new Set([
     "createPresignedUrl",
 ]);
 
+// Default placeholder webhook URL for S3 Gateway alerts (to be replaced by the user or configured via env.ALERT_WEBHOOK_URL or license.security_policy.alerting.webhook_url)
+const DEFAULT_ALERT_WEBHOOK_URL = "https://your-webhook-endpoint.example.com/s3gw-alerts";
+
 const kvCache = new Map();
 const CACHE_TTL_MS = 60000;
 const NEGATIVE_CACHE_TTL_MS = 5000;
@@ -173,6 +176,11 @@ export default {
         const asn = request.cf?.asn || "N/A";
         const asOrganization = request.cf?.asOrganization || "Unknown ISP";
 
+        // AI Agent & Workflow Attribution Headers (optional, non-blocking)
+        const agentId = request.headers.get("X-Agent-ID") || request.headers.get("x-agent-id") || null;
+        const workflowId = request.headers.get("X-Workflow-ID") || request.headers.get("x-workflow-id") || null;
+        const sessionId = request.headers.get("X-Session-ID") || request.headers.get("x-session-id") || null;
+
         let rawTargetPath = url.pathname;
         const hostName = url.hostname.toLowerCase();
         if (hostName !== configuredGatewayHost && hostName.endsWith("." + configuredGatewayHost)) {
@@ -183,22 +191,26 @@ export default {
         if (rawTargetPath === "/_s3gw/presign") {
             return handlePresignMintRequest({
                 request, env, ctx, url, startMs, configuredGatewayHost, corsAllowedOrigins,
-                authHeader, sourceIP, method, contentLength, userAgent, country, city, asn, asOrganization
+                authHeader, sourceIP, method, contentLength, userAgent, country, city, asn, asOrganization,
+                agentId, workflowId, sessionId
             });
         }
 
         if (rawTargetPath.startsWith("/dl/") || rawTargetPath.startsWith("/s/")) {
             return handleCloakedTokenRequest({
                 request, env, ctx, url, rawTargetPath, startMs, configuredGatewayHost, corsAllowedOrigins,
-                sourceIP, method, contentLength, userAgent, country, city, asn, asOrganization
+                sourceIP, method, contentLength, userAgent, country, city, asn, asOrganization,
+                agentId, workflowId, sessionId
             });
         }
 
         let { normalizedPath, segments: pathParts, hasTraversal } = normalizeAndInspectPath(rawTargetPath);
         let requestedBucket = pathParts.length > 0 ? pathParts[0] : "";
         let s3Operation = resolveS3Operation(method, normalizedPath, queryString, request.headers);
+        const queryPrefix = url.searchParams.get("prefix") || null;
+        const queryDelimiter = url.searchParams.get("delimiter") || null;
 
-        const logAndReject = (logLicenseKey, gwKeyUsed, bucketForLog, status, code, message, blockReason, riskLevel = "high", policyCorsOrigins = corsAllowedOrigins, authMeta = undefined) => {
+        const logAndReject = (logLicenseKey, gwKeyUsed, bucketForLog, status, code, message, blockReason, riskLevel = "high", policyCorsOrigins = corsAllowedOrigins, authMeta = undefined, canaryInfo = undefined) => {
             const durationMs = Date.now() - startMs;
             const logEntry = buildLogEntry({
                 licenseKey: logLicenseKey,
@@ -225,7 +237,13 @@ export default {
                     message,
                     blockReason,
                     riskLevel
-                }
+                },
+                agentId,
+                workflowId,
+                sessionId,
+                canaryInfo,
+                queryPrefix,
+                queryDelimiter
             });
             if (env.R2_GATEWAY && ctx?.waitUntil) {
                 ctx.waitUntil(writeLog(env, logLicenseKey, logEntry));
@@ -294,6 +312,8 @@ export default {
                 authMeta
             );
         }
+
+        let canaryCheck = checkCanaryHit(normalizedPath, license, method, s3Operation);
 
         const licenseCorsOrigins = parseAllowedOrigins(
             license.security_policy?.allowed_origins ||
@@ -440,8 +460,10 @@ export default {
             pathParts = [license.bucket, ...restSegments];
             requestedBucket = license.bucket;
             s3Operation = resolveS3Operation(method, normalizedPath, isQuerySigV4 ? stripSigV4QueryParams(url.searchParams) : queryString, request.headers);
+            canaryCheck = checkCanaryHit(normalizedPath, license, method, s3Operation);
         } else if (isQuerySigV4) {
             s3Operation = resolveS3Operation(method, normalizedPath, stripSigV4QueryParams(url.searchParams), request.headers);
+            canaryCheck = checkCanaryHit(normalizedPath, license, method, s3Operation);
         }
 
         if (requestedBucket && requestedBucket !== license.bucket) {
@@ -495,6 +517,28 @@ export default {
 
         const secDecision = checkSecurityPolicy(env, request, url, normalizedPath, license, s3Operation, sourceIP, country, asn, userAgent);
         if (!secDecision.allowed) {
+            if (secDecision.blockReason === "RANSOMWARE_EXTENSION_DETECTED" && ctx?.waitUntil) {
+                ctx.waitUntil(sendSecurityAlertWebhook(env, license, {
+                    alertType: "ransomware_killswitch",
+                    bucket: license.bucket,
+                    key: normalizedPath,
+                    method,
+                    s3Operation,
+                    status: secDecision.status || 403,
+                    blockReason: secDecision.blockReason,
+                    detailMessage: secDecision.message,
+                    sourceIP,
+                    country,
+                    city,
+                    asn,
+                    asOrganization,
+                    userAgent,
+                    agentId,
+                    workflowId,
+                    sessionId,
+                    timestamp: new Date().toISOString()
+                }));
+            }
             return logAndReject(
                 licenseKey,
                 gwAccessKeyReceived,
@@ -531,7 +575,11 @@ export default {
                     status: 200,
                     durationMs,
                     authMeta,
-                    securityDecision: undefined
+                    securityDecision: undefined,
+                    agentId,
+                    workflowId,
+                    sessionId,
+                    canaryInfo: canaryCheck
                 });
                 if (env.R2_GATEWAY && ctx?.waitUntil) {
                     ctx.waitUntil(writeLog(env, licenseKey, logEntry));
@@ -556,18 +604,39 @@ export default {
 
         let deleteObjectsCount = 1;
         let preReadBodyBuffer = null;
+        const alertContext = {
+            bucket: license.bucket,
+            key: normalizedPath,
+            method,
+            s3Operation,
+            sourceIP,
+            country,
+            city,
+            asn,
+            asOrganization,
+            userAgent,
+            agentId,
+            workflowId,
+            sessionId,
+        };
         if (s3Operation === "deleteObjects" && request.body && contentLength <= 2 * 1024 * 1024) {
             try {
                 preReadBodyBuffer = await request.arrayBuffer();
                 const xmlText = new TextDecoder().decode(preReadBodyBuffer);
                 deleteObjectsCount = countDeleteObjectsInXml(xmlText);
+                if (!canaryCheck.hit) {
+                    const batchCanary = checkBatchDeleteCanaryHit(xmlText, license);
+                    if (batchCanary.hit) {
+                        canaryCheck = batchCanary;
+                    }
+                }
             } catch (e) {
                 deleteObjectsCount = 1;
             }
 
             const quotas = (license.security_policy || license.securityPolicy || {}).dlp_quotas || (license.security_policy || license.securityPolicy || {}).dlpQuotas;
             if (!disableDlpKv && quotas?.max_delete_requests_per_minute && deleteObjectsCount > quotas.max_delete_requests_per_minute) {
-                ctx.waitUntil(trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, method, s3Operation, 0, deleteObjectsCount));
+                ctx.waitUntil(trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, method, s3Operation, 0, deleteObjectsCount, alertContext));
                 return logAndReject(
                     licenseKey,
                     gwAccessKeyReceived,
@@ -583,7 +652,7 @@ export default {
             }
         }
 
-        const shouldLog = decideShouldLog(method, s3Operation, contentLength);
+        const shouldLog = decideShouldLog(method, s3Operation, contentLength) || canaryCheck.hit;
 
         const backendResp = await forwardToBackend(request, url, rawTargetPath, license, env, preReadBodyBuffer, {
             stripSigV4Query: isQuerySigV4
@@ -594,7 +663,7 @@ export default {
         const actualBytes = (method === "GET" || s3Operation === "getObject") ? respBytes : contentLength;
 
         if (!disableDlpKv && (backendResp.ok || backendResp.status === 304)) {
-            ctx.waitUntil(trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, method, s3Operation, actualBytes, deleteObjectsCount));
+            ctx.waitUntil(trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, method, s3Operation, actualBytes, deleteObjectsCount, alertContext));
         }
 
         if (shouldLog) {
@@ -616,10 +685,38 @@ export default {
                 status: backendResp.status,
                 durationMs,
                 authMeta,
-                securityDecision: undefined
+                securityDecision: undefined,
+                agentId,
+                workflowId,
+                sessionId,
+                canaryInfo: canaryCheck,
+                queryPrefix,
+                queryDelimiter
             });
 
             ctx.waitUntil(writeLog(env, licenseKey, logEntry));
+        }
+
+        if (canaryCheck.hit && ctx?.waitUntil) {
+            ctx.waitUntil(sendSecurityAlertWebhook(env, license, {
+                alertType: "canary_tripped",
+                bucket: license.bucket,
+                key: canaryCheck.matchedKey || normalizedPath,
+                matchedCanary: canaryCheck.matchedCanary,
+                method,
+                s3Operation,
+                status: backendResp.status,
+                sourceIP,
+                country,
+                city,
+                asn,
+                asOrganization,
+                userAgent,
+                agentId,
+                workflowId,
+                sessionId,
+                timestamp: new Date().toISOString()
+            }));
         }
 
         const respHeaders = sanitizeBackendResponseHeaders(backendResp.headers, license, {
@@ -874,7 +971,8 @@ async function markSingleUseTokenConsumed(env, licenseKey, jti, remainingTtlSeco
 
 async function handlePresignMintRequest({
     request, env, ctx, url, startMs, configuredGatewayHost, corsAllowedOrigins,
-    authHeader, sourceIP, method, contentLength, userAgent, country, city, asn, asOrganization
+    authHeader, sourceIP, method, contentLength, userAgent, country, city, asn, asOrganization,
+    agentId, workflowId, sessionId
 }) {
     const s3Operation = "createPresignedUrl";
     const jsonReject = (logLicenseKey, gwKeyUsed, bucketForLog, status, code, message, blockReason, riskLevel = "high", policyCorsOrigins = corsAllowedOrigins, authMeta = { mode: "presign_mint" }) => {
@@ -897,7 +995,10 @@ async function handlePresignMintRequest({
             status,
             durationMs,
             authMeta,
-            securityDecision: { allowed: false, status, code, message, blockReason, riskLevel }
+            securityDecision: { allowed: false, status, code, message, blockReason, riskLevel },
+            agentId,
+            workflowId,
+            sessionId
         });
         if (env.R2_GATEWAY && ctx?.waitUntil) {
             ctx.waitUntil(writeLog(env, logLicenseKey, logEntry));
@@ -1098,7 +1199,10 @@ async function handlePresignMintRequest({
         status: 200,
         durationMs,
         authMeta,
-        securityDecision: undefined
+        securityDecision: undefined,
+        agentId,
+        workflowId,
+        sessionId
     });
     if (env.R2_GATEWAY && ctx?.waitUntil) {
         ctx.waitUntil(writeLog(env, licenseKey, logEntry));
@@ -1128,12 +1232,13 @@ async function handlePresignMintRequest({
 
 async function handleCloakedTokenRequest({
     request, env, ctx, url, rawTargetPath, startMs, configuredGatewayHost, corsAllowedOrigins,
-    sourceIP, method, contentLength, userAgent, country, city, asn, asOrganization
+    sourceIP, method, contentLength, userAgent, country, city, asn, asOrganization,
+    agentId, workflowId, sessionId
 }) {
     const prefixLen = rawTargetPath.startsWith("/dl/") ? 4 : 3;
     const rawToken = rawTargetPath.slice(prefixLen).split("/")[0].trim();
 
-    const rejectToken = (logLicenseKey, gwKeyUsed, bucketForLog, loggedPath, opType, status, code, message, blockReason, riskLevel = "high", policyCorsOrigins = corsAllowedOrigins, authMeta = { mode: "cloaked_token" }) => {
+    const rejectToken = (logLicenseKey, gwKeyUsed, bucketForLog, loggedPath, opType, status, code, message, blockReason, riskLevel = "high", policyCorsOrigins = corsAllowedOrigins, authMeta = { mode: "cloaked_token" }, canaryInfo = undefined) => {
         const durationMs = Date.now() - startMs;
         const logEntry = buildLogEntry({
             licenseKey: logLicenseKey,
@@ -1153,7 +1258,11 @@ async function handleCloakedTokenRequest({
             status,
             durationMs,
             authMeta,
-            securityDecision: { allowed: false, status, code, message, blockReason, riskLevel }
+            securityDecision: { allowed: false, status, code, message, blockReason, riskLevel },
+            agentId,
+            workflowId,
+            sessionId,
+            canaryInfo
         });
         if (env.R2_GATEWAY && ctx?.waitUntil) {
             ctx.waitUntil(writeLog(env, logLicenseKey, logEntry));
@@ -1249,6 +1358,7 @@ async function handleCloakedTokenRequest({
     const tokenMethod = String(payload.m || "GET").toUpperCase();
     const methodAllowedByToken = method === tokenMethod || (tokenMethod === "GET" && method === "HEAD");
     const s3Operation = method === "PUT" ? "putObject" : (method === "HEAD" ? "headObject" : "getObject");
+    const canaryCheck = checkCanaryHit(backendTargetPath, license, method, s3Operation);
 
     if (!methodAllowedByToken || !presignedCfg.allowedMethods.includes(method)) {
         return rejectToken(licenseKey, gwAccessKeyReceived, license.bucket, backendTargetPath, s3Operation, 403, "AccessDenied", `HTTP method '${method}' is not permitted for this link.`, "PRESIGNED_METHOD_NOT_ALLOWED", "high", licenseCorsOrigins, authMeta);
@@ -1266,6 +1376,28 @@ async function handleCloakedTokenRequest({
 
     const secDecision = checkSecurityPolicy(env, request, url, backendTargetPath, license, s3Operation, sourceIP, country, asn, userAgent);
     if (!secDecision.allowed) {
+        if (secDecision.blockReason === "RANSOMWARE_EXTENSION_DETECTED" && ctx?.waitUntil) {
+            ctx.waitUntil(sendSecurityAlertWebhook(env, license, {
+                alertType: "ransomware_killswitch",
+                bucket: license.bucket,
+                key: backendTargetPath,
+                method,
+                s3Operation,
+                status: secDecision.status || 403,
+                blockReason: secDecision.blockReason,
+                detailMessage: secDecision.message,
+                sourceIP,
+                country,
+                city,
+                asn,
+                asOrganization,
+                userAgent,
+                agentId,
+                workflowId,
+                sessionId,
+                timestamp: new Date().toISOString()
+            }));
+        }
         return rejectToken(licenseKey, gwAccessKeyReceived, license.bucket, backendTargetPath, s3Operation, secDecision.status || 403, secDecision.code || "AccessDenied", secDecision.message, secDecision.blockReason || "SECURITY_POLICY_VIOLATION", secDecision.riskLevel || "high", licenseCorsOrigins, authMeta);
     }
 
@@ -1298,7 +1430,21 @@ async function handleCloakedTokenRequest({
 
     if (!disableDlpKv && (backendResp.ok || backendResp.status === 206 || backendResp.status === 304)) {
         if (ctx?.waitUntil) {
-            ctx.waitUntil(trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, method, s3Operation, actualBytes, 1));
+            ctx.waitUntil(trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, method, s3Operation, actualBytes, 1, {
+                bucket: license.bucket,
+                key: backendTargetPath,
+                method,
+                s3Operation,
+                sourceIP,
+                country,
+                city,
+                asn,
+                asOrganization,
+                userAgent,
+                agentId,
+                workflowId,
+                sessionId,
+            }));
         }
     }
 
@@ -1320,10 +1466,36 @@ async function handleCloakedTokenRequest({
         status: backendResp.status,
         durationMs,
         authMeta,
-        securityDecision: undefined
+        securityDecision: undefined,
+        agentId,
+        workflowId,
+        sessionId,
+        canaryInfo: canaryCheck
     });
     if (env.R2_GATEWAY && ctx?.waitUntil) {
         ctx.waitUntil(writeLog(env, licenseKey, logEntry));
+    }
+
+    if (canaryCheck.hit && ctx?.waitUntil) {
+        ctx.waitUntil(sendSecurityAlertWebhook(env, license, {
+            alertType: "canary_tripped",
+            bucket: license.bucket,
+            key: backendTargetPath,
+            matchedCanary: canaryCheck.matchedCanary,
+            method,
+            s3Operation,
+            status: backendResp.status,
+            sourceIP,
+            country,
+            city,
+            asn,
+            asOrganization,
+            userAgent,
+            agentId,
+            workflowId,
+            sessionId,
+            timestamp: new Date().toISOString()
+        }));
     }
 
     const respHeaders = sanitizeBackendResponseHeaders(backendResp.headers, license, {
@@ -1359,6 +1531,7 @@ function sanitizeBackendResponseHeaders(backendHeaders, license, overrides = {})
                     CLOAKED_EXACT_HEADERS.has(lower) ||
                     lower === "x-amz-id-2" ||
                     lower === "x-amz-request-id" ||
+                    lower === "x-amz-bucket-region" ||
                     lower.startsWith("x-scw-") ||
                     lower.startsWith("x-ovh-") ||
                     lower.startsWith("x-rgw-")
@@ -1935,6 +2108,7 @@ function resolveS3Operation(method, path, queryString, headers = null) {
         const segments = path.split("/").filter(Boolean);
         const isObject = segments.length > 1;
         if (segments.length === 0) return "listBuckets";
+        if (!isObject && params.has("location")) return "getBucketLocation";
         if (params.has("tagging")) return isObject ? "getObjectTagging" : "getBucketTagging";
         if (params.has("acl")) return isObject ? "getObjectAcl" : "getBucketAcl";
         if (params.has("versioning")) return "getBucketVersioning";
@@ -2354,7 +2528,7 @@ async function triggerKeyQuarantine(env, licenseKey, sourceIP, quarantinePayload
     await Promise.all(puts);
 }
 
-async function trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, method, s3Operation, actualBytes, deleteObjectsCount = 1) {
+async function trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, method, s3Operation, actualBytes, deleteObjectsCount = 1, alertContext = null) {
     try {
         const sec = license.security_policy || license.securityPolicy || {};
         const quotas = sec.dlp_quotas || sec.dlpQuotas;
@@ -2366,19 +2540,22 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, m
         const minute = now.getUTCMinutes();
 
         const quarantineDuration = quotas.quarantine_duration_seconds || 3600;
+        let triggeredQuarantine = null;
 
         if ((method === "GET" || s3Operation === "getObject") && actualBytes > 0 && quotas.max_download_bytes_per_hour) {
             const hourKey = `dlp:${licenseKey}:bytes:${ymd}-${hour}`;
             const newTotal = await incrementDlpCounter(env, hourKey, actualBytes, 7200);
 
             if (newTotal > quotas.max_download_bytes_per_hour) {
-                await triggerKeyQuarantine(env, licenseKey, sourceIP, {
+                const qPayload = {
                     reason: "QUOTA_EXFILTRATION_BYTES_EXCEEDED",
                     bytes_downloaded: newTotal,
                     limit: quotas.max_download_bytes_per_hour,
                     trigger_ip: sourceIP || "unknown",
                     quarantined_at: now.toISOString()
-                }, quarantineDuration);
+                };
+                await triggerKeyQuarantine(env, licenseKey, sourceIP, qPayload, quarantineDuration);
+                triggeredQuarantine = qPayload;
             }
         }
 
@@ -2387,13 +2564,15 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, m
             const newReqs = await incrementDlpCounter(env, minKey, 1, 300);
 
             if (newReqs > quotas.max_get_requests_per_minute) {
-                await triggerKeyQuarantine(env, licenseKey, sourceIP, {
+                const qPayload = {
                     reason: "QUOTA_GET_REQUESTS_PER_MINUTE_EXCEEDED",
                     requests_count: newReqs,
                     limit: quotas.max_get_requests_per_minute,
                     trigger_ip: sourceIP || "unknown",
                     quarantined_at: now.toISOString()
-                }, quarantineDuration);
+                };
+                await triggerKeyQuarantine(env, licenseKey, sourceIP, qPayload, quarantineDuration);
+                if (!triggeredQuarantine) triggeredQuarantine = qPayload;
             }
         }
 
@@ -2403,14 +2582,42 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, m
             const newReqs = await incrementDlpCounter(env, minKey, incrementBy, 300);
 
             if (newReqs > quotas.max_delete_requests_per_minute) {
-                await triggerKeyQuarantine(env, licenseKey, sourceIP, {
+                const qPayload = {
                     reason: "QUOTA_DELETE_REQUESTS_PER_MINUTE_EXCEEDED",
                     requests_count: newReqs,
                     limit: quotas.max_delete_requests_per_minute,
                     trigger_ip: sourceIP || "unknown",
                     quarantined_at: now.toISOString()
-                }, quarantineDuration);
+                };
+                await triggerKeyQuarantine(env, licenseKey, sourceIP, qPayload, quarantineDuration);
+                if (!triggeredQuarantine) triggeredQuarantine = qPayload;
             }
+        }
+
+        if (triggeredQuarantine) {
+            await sendSecurityAlertWebhook(env, license, {
+                alertType: "dlp_quarantine",
+                bucket: alertContext?.bucket || license.bucket,
+                key: alertContext?.key || "/",
+                method: alertContext?.method || method,
+                s3Operation: alertContext?.s3Operation || s3Operation,
+                status: 429,
+                blockReason: triggeredQuarantine.reason,
+                quarantineInfo: {
+                    ...triggeredQuarantine,
+                    duration_seconds: quarantineDuration
+                },
+                sourceIP: alertContext?.sourceIP || sourceIP,
+                country: alertContext?.country || "Unknown",
+                city: alertContext?.city || "Unknown",
+                asn: alertContext?.asn || "N/A",
+                asOrganization: alertContext?.asOrganization || "Unknown ISP",
+                userAgent: alertContext?.userAgent || "",
+                agentId: alertContext?.agentId || null,
+                workflowId: alertContext?.workflowId || null,
+                sessionId: alertContext?.sessionId || null,
+                timestamp: now.toISOString()
+            });
         }
     } catch (e) {
         console.error("trackDlpQuotasAndQuarantine error:", e.message);
@@ -2418,7 +2625,8 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, m
 }
 
 function buildLogEntry({ licenseKey, gwHost, sourceIP, country, city, asn, asOrganization, userAgent, gwAccessKey,
-    method, s3Operation, path, bucket, contentLength, status, durationMs, authMeta, securityDecision }) {
+    method, s3Operation, path, bucket, contentLength, status, durationMs, authMeta, securityDecision,
+    agentId, workflowId, sessionId, canaryInfo, queryPrefix = null, queryDelimiter = null }) {
     const flags = [];
     if (["deleteObject", "deleteObjects", "deleteBucket"].includes(s3Operation)) flags.push("delete_operation");
     if (["putObject", "copyObject", "uploadPart", "postObject", "createMultipartUpload", "completeMultipartUpload"].includes(s3Operation)) flags.push("write_operation");
@@ -2442,6 +2650,10 @@ function buildLogEntry({ licenseKey, gwHost, sourceIP, country, city, asn, asOrg
     if (status === 403) flags.push("access_denied");
     if (status === 429) flags.push("dlp_quarantine_blocked");
 
+    if (canaryInfo?.hit) {
+        flags.push("canary_tripped");
+    }
+
     let action = "allowed";
     let blockReason = null;
     let riskLevel = "info";
@@ -2462,7 +2674,30 @@ function buildLogEntry({ licenseKey, gwHost, sourceIP, country, city, asn, asOrg
         if (blockReason) flags.push(blockReason.toLowerCase());
     }
 
-    const keyPath = path === `/${bucket}` ? "/" : path.replace(/^\/[^/]+\//, "/");
+    if (canaryInfo?.hit) {
+        riskLevel = "critical";
+    }
+
+    let keyPath = path === `/${bucket}` ? "/" : path.replace(/^\/[^/]+\//, "/");
+    if (s3Operation === "listObjects" && queryPrefix) {
+        const cleanPrefix = String(queryPrefix).replace(/^\/+/, "");
+        if (cleanPrefix) {
+            keyPath = `/${cleanPrefix}`;
+        }
+    }
+
+    const operationObj = {
+        method,
+        type: s3Operation,
+        bucket,
+        key: keyPath,
+    };
+    if (s3Operation === "listObjects" && queryPrefix) {
+        operationObj.prefix = queryPrefix;
+    }
+    if (s3Operation === "listObjects" && queryDelimiter) {
+        operationObj.delimiter = queryDelimiter;
+    }
 
     const entry = {
         ts: new Date().toISOString(),
@@ -2474,16 +2709,11 @@ function buildLogEntry({ licenseKey, gwHost, sourceIP, country, city, asn, asOrg
             city,
             asn,
             as_organization: asOrganization,
-            user_agent: userAgent,
+            user_agent: userAgent || null,
             access_key_used: gwAccessKey,
             auth_mode: authMeta?.mode || "sigv4_header",
         },
-        operation: {
-            method,
-            type: s3Operation,
-            bucket,
-            key: keyPath,
-        },
+        operation: operationObj,
         response: {
             status,
             bytes: contentLength || 0,
@@ -2496,6 +2726,19 @@ function buildLogEntry({ licenseKey, gwHost, sourceIP, country, city, asn, asOrg
             flags,
         },
     };
+
+    if (canaryInfo?.hit) {
+        entry.security.canary_hit = true;
+        entry.security.matched_canary = canaryInfo.matchedCanary || null;
+    }
+
+    if (agentId || workflowId || sessionId) {
+        entry.ai_context = {
+            agent_id: agentId || null,
+            workflow_id: workflowId || null,
+            session_id: sessionId || null,
+        };
+    }
 
     if (authMeta?.tokenJti || authMeta?.correlationId || authMeta?.singleUse !== undefined || authMeta?.ipBound) {
         entry.correlation = {
@@ -2536,6 +2779,217 @@ async function writeLog(env, licenseKey, logEntry) {
     } catch (e) {
         console.error("writeLog error:", e.message);
     }
+}
+
+function checkCanaryHit(targetPath, license, method = "GET", s3Operation = "getObject") {
+    if (!targetPath || !license) return { hit: false };
+
+    const upperMethod = String(method || "").toUpperCase();
+    const isMonitoredAction =
+        upperMethod === "GET" ||
+        upperMethod === "DELETE" ||
+        s3Operation === "getObject" ||
+        s3Operation === "deleteObject" ||
+        s3Operation === "deleteObjects";
+    if (!isMonitoredAction) {
+        return { hit: false };
+    }
+
+    const canaryList = license.security_policy?.canary_objects || license.security_policy?.canary_paths;
+    if (!Array.isArray(canaryList) || canaryList.length === 0) {
+        return { hit: false };
+    }
+
+    const cleanTargetPath = String(targetPath).replace(/^\/+/, "");
+    const bucket = license.bucket ? String(license.bucket).trim() : null;
+    const strippedBucketPath = (bucket && cleanTargetPath.startsWith(`${bucket}/`))
+        ? cleanTargetPath.slice(bucket.length + 1)
+        : cleanTargetPath;
+
+    for (const rawCanary of canaryList) {
+        if (!rawCanary || typeof rawCanary !== "string") continue;
+        const cleanCanary = rawCanary.trim().replace(/^\/+/, "");
+        if (!cleanCanary) continue;
+
+        if (cleanTargetPath === cleanCanary || strippedBucketPath === cleanCanary) {
+            return { hit: true, matchedCanary: rawCanary, matchedKey: `/${strippedBucketPath}` };
+        }
+        if (cleanCanary.endsWith("/*")) {
+            const prefix = cleanCanary.slice(0, -1);
+            if (cleanTargetPath.startsWith(prefix) || strippedBucketPath.startsWith(prefix)) {
+                return { hit: true, matchedCanary: rawCanary, matchedKey: `/${strippedBucketPath}` };
+            }
+        }
+    }
+
+    return { hit: false };
+}
+
+function checkBatchDeleteCanaryHit(xmlText, license) {
+    if (!xmlText || !license) return { hit: false };
+    const canaryList = license.security_policy?.canary_objects || license.security_policy?.canary_paths;
+    if (!Array.isArray(canaryList) || canaryList.length === 0) {
+        return { hit: false };
+    }
+    const keyRegex = /<(?:[a-zA-Z0-9_-]+:)?Key>([\s\S]*?)<\/(?:[a-zA-Z0-9_-]+:)?Key>/g;
+    let m;
+    while ((m = keyRegex.exec(xmlText)) !== null) {
+        const rawKey = m[1].trim();
+        if (!rawKey) continue;
+        const res = checkCanaryHit(`/${license.bucket}/${rawKey}`, license, "DELETE", "deleteObjects");
+        if (res.hit) return res;
+    }
+    return { hit: false };
+}
+
+async function sendSecurityAlertWebhook(env, license, alertInfo) {
+    try {
+        const webhookUrl = license?.security_policy?.alerting?.webhook_url
+            || license?.alert_webhook_url
+            || env?.ALERT_WEBHOOK_URL
+            || DEFAULT_ALERT_WEBHOOK_URL;
+
+        if (!webhookUrl || webhookUrl === DEFAULT_ALERT_WEBHOOK_URL || webhookUrl.includes("example.com")) {
+            console.warn("sendSecurityAlertWebhook: Default placeholder webhook URL detected. Configure ALERT_WEBHOOK_URL in environment or license.security_policy.alerting.webhook_url to receive live alerts.");
+            return;
+        }
+
+        const alertType = alertInfo.alertType || "canary_tripped";
+        const geoStr = [alertInfo.city, alertInfo.country].filter(Boolean).join(", ");
+        const asnStr = alertInfo.asn ? `AS${alertInfo.asn}${alertInfo.asOrganization ? " (" + alertInfo.asOrganization + ")" : ""}` : null;
+        const locParts = [geoStr, asnStr].filter(Boolean).join(" - ");
+        const tsIso = alertInfo.timestamp || new Date().toISOString();
+
+        let eventName = "s3gw.security.canary_tripped";
+        let headerTitle = "[ALERT] S3 Gateway Security Incident: Canary Tripwire Triggered";
+        let jsonTitle = "[SECURITY ALERT] Canary Tripwire Triggered - S3 Gateway";
+        let summary = `S3 Gateway canary tripwire '${alertInfo.matchedCanary || alertInfo.key}' accessed in bucket '${alertInfo.bucket}' by IP ${alertInfo.sourceIP}`;
+        let detailLines = [
+            `- Bucket: ${alertInfo.bucket || "unknown"}`,
+            `- Targeted Key: ${alertInfo.key || "unknown"}`,
+            `- Matched Canary Rule: ${alertInfo.matchedCanary || alertInfo.key || "unknown"}`,
+            `- Operation: ${alertInfo.s3Operation || "unknown"} (${alertInfo.method || "unknown"})`,
+            `- Response Status: ${alertInfo.status || "unknown"} (Stealth pass-through)`,
+        ];
+        let actionLines = [
+            "Request was allowed in stealth pass-through mode without warning to caller.",
+            "Access recorded in audit log with risk_level=critical and flag=canary_tripped.",
+            "Immediate SOC investigation recommended.",
+        ];
+
+        if (alertType === "ransomware_killswitch") {
+            eventName = "s3gw.security.ransomware_killswitch_triggered";
+            headerTitle = "[ALERT] S3 Gateway Security Incident: Ransomware Extension Killswitch Triggered";
+            jsonTitle = "[SECURITY ALERT] Ransomware Killswitch Triggered - S3 Gateway";
+            summary = `S3 Gateway blocked ransomware upload on '${alertInfo.key}' in bucket '${alertInfo.bucket}' from IP ${alertInfo.sourceIP}`;
+            detailLines = [
+                `- Bucket: ${alertInfo.bucket || "unknown"}`,
+                `- Targeted Key: ${alertInfo.key || "unknown"}`,
+                `- Operation: ${alertInfo.s3Operation || "unknown"} (${alertInfo.method || "unknown"})`,
+                `- Block Reason: ${alertInfo.blockReason || "RANSOMWARE_EXTENSION_DETECTED"}`,
+                `- Detail: ${alertInfo.detailMessage || "Blocked by S3 Gateway ransomware killswitch"}`,
+                `- Response Status: ${alertInfo.status || 403} (Blocked at Edge)`,
+            ];
+            actionLines = [
+                "Upload was blocked inline at the S3 Gateway Edge before reaching backend storage.",
+                "Isolate the source host/agent and verify credentials immediately.",
+            ];
+        } else if (alertType === "dlp_quarantine") {
+            eventName = "s3gw.security.dlp_quarantine_triggered";
+            headerTitle = "[ALERT] S3 Gateway Security Incident: DLP Exfiltration Quota Exceeded - Key Quarantined";
+            jsonTitle = "[SECURITY ALERT] DLP Quarantine Activated - S3 Gateway";
+            const q = alertInfo.quarantineInfo || {};
+            const metricLine = q.bytes_downloaded !== undefined
+                ? `- Downloaded Volume: ${q.bytes_downloaded} bytes (limit: ${q.limit} bytes/hour)`
+                : `- Request Count: ${q.requests_count ?? "exceeded"} (limit: ${q.limit ?? "configured"}/min)`;
+            summary = `S3 Gateway quarantined key on bucket '${alertInfo.bucket}' (${alertInfo.blockReason || q.reason || "QUOTA_EXCEEDED"}) triggered by IP ${alertInfo.sourceIP}`;
+            detailLines = [
+                `- Bucket: ${alertInfo.bucket || "unknown"}`,
+                `- Triggering Key: ${alertInfo.key || "/"}`,
+                `- Operation: ${alertInfo.s3Operation || "unknown"} (${alertInfo.method || "unknown"})`,
+                `- Quarantine Reason: ${alertInfo.blockReason || q.reason || "DLP_QUOTA_EXCEEDED"}`,
+                metricLine,
+                `- Quarantine Duration: ${q.duration_seconds || 3600}s (HTTP 429 SlowDown enforced)`,
+            ];
+            actionLines = [
+                "Virtual gateway key and source IP were automatically quarantined in Edge LRU + KV.",
+                "All subsequent requests are blocked with HTTP 429 until quarantine expires or is cleared.",
+                "Investigate potential mass exfiltration, scraping loop, or compromised AI agent.",
+            ];
+        }
+
+        const plainTextAlert = [
+            headerTitle,
+            "Severity: CRITICAL",
+            "Source: S3 Gateway (s3gw)",
+            `Timestamp: ${tsIso}`,
+            "",
+            "INCIDENT DETAILS:",
+            ...detailLines,
+            "",
+            "ATTRIBUTION & CONTEXT:",
+            `- Source IP: ${alertInfo.sourceIP || "unknown"}${locParts ? ` (${locParts})` : ""}`,
+            `- User-Agent: ${alertInfo.userAgent || "none"}`,
+            `- AI Agent ID: ${alertInfo.agentId || "none"}`,
+            `- AI Workflow ID: ${alertInfo.workflowId || "none"}`,
+            `- AI Session ID: ${alertInfo.sessionId || "none"}`,
+            `- License Key: ${license?.gateway?.access_key || license?.license_key || license?.key || "configured"}`,
+            "",
+            "ACTION TAKEN:",
+            ...actionLines
+        ].join("\n");
+
+        const payload = {
+            event: eventName,
+            source: "S3 Gateway (s3gw)",
+            severity: "CRITICAL",
+            timestamp: tsIso,
+            title: jsonTitle,
+            summary,
+            text: plainTextAlert,
+            content: plainTextAlert,
+            details: {
+                alert_type: alertType,
+                bucket: alertInfo.bucket,
+                key: alertInfo.key,
+                matched_canary: alertInfo.matchedCanary || null,
+                block_reason: alertInfo.blockReason || null,
+                quarantine: alertInfo.quarantineInfo || null,
+                s3_operation: alertInfo.s3Operation,
+                http_method: alertInfo.method,
+                status: alertInfo.status,
+                source_ip: alertInfo.sourceIP,
+                country: alertInfo.country,
+                city: alertInfo.city,
+                asn: alertInfo.asn,
+                as_organization: alertInfo.asOrganization,
+                user_agent: alertInfo.userAgent,
+                ai_agent_id: alertInfo.agentId || null,
+                ai_workflow_id: alertInfo.workflowId || null,
+                ai_session_id: alertInfo.sessionId || null,
+                license: license?.gateway?.access_key || license?.license_key || license?.key || null
+            }
+        };
+
+        const resp = await fetch(webhookUrl, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "User-Agent": "s3gw-alerting/1.0"
+            },
+            body: JSON.stringify(payload)
+        });
+
+        if (!resp.ok) {
+            console.error(`sendSecurityAlertWebhook HTTP error: ${resp.status} ${resp.statusText}`);
+        }
+    } catch (e) {
+        console.error("sendSecurityAlertWebhook error:", e.message);
+    }
+}
+
+async function sendCanaryWebhook(env, license, alertInfo) {
+    return sendSecurityAlertWebhook(env, license, { ...alertInfo, alertType: "canary_tripped" });
 }
 
 function extractAccessKeyFromAuth(authHeader) {

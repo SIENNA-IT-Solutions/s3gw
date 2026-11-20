@@ -1,12 +1,12 @@
 {
   "activated": true,
   "expires_at": "2099-12-31T23:59:59Z",
-  "bucket": "your-bucket-name",
+  "bucket": "YOUR_BACKEND_BUCKET_NAME",
   "disable_dlp_kv_writes": false,
   "gateway": {
     "enabled": true,
-    "access_key": "YOUR_GATEWAY_ACCESS_KEY",
-    "secret_key": "YOUR_GATEWAY_SECRET_KEY",
+    "access_key": "YOUR_VIRTUAL_GATEWAY_ACCESS_KEY",
+    "secret_key": "YOUR_VIRTUAL_GATEWAY_SECRET_KEY",
     "created_at": "2026-01-01T00:00:00.000Z",
     "cloak_backend_headers": true,
     "presigned_urls": {
@@ -31,47 +31,23 @@
   "forceVirtualHost": true,
   "forcePathStyle": false,
   "security_policy": {
-    "allowed_origins": [
-      "*"
-    ],
-    "allowed_countries": [
-      "FR",
-      "BE",
-      "DE",
-      "CH",
-      "US",
-      "GB"
-    ],
-    "blocked_countries": [
-      "RU",
-      "CN",
-      "KP",
-      "IR"
-    ],
+    "allowed_origins": [],
+    "allowed_countries": [],
+    "blocked_countries": [],
     "allowed_ips": [],
-    "blocked_ips": [
-      "185.220.101.0/24"
-    ],
+    "blocked_ips": [],
     "allowed_asns": [],
-    "blocked_asns": [
-      4134,
-      4837
-    ],
+    "blocked_asns": [],
     "allowed_user_agents": [],
-    "blocked_user_agents": [
-      "sqlmap",
-      "nikto",
-      "nmap"
-    ],
+    "blocked_user_agents": [],
     "allowed_extensions": [],
-    "blocked_extensions": [
-      ".exe",
-      ".sh",
-      ".bat",
-      ".ps1"
-    ],
+    "blocked_extensions": [],
     "allow_admin_operations": false,
     "ransomware_killswitch": true,
+    "canary_paths": [],
+    "alerting": {
+      "webhook_url": ""
+    },
     "dlp_quotas": {
       "enabled": true,
       "max_download_bytes_per_hour": 10737418240,

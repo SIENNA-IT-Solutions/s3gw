@@ -1006,8 +1006,7 @@ async function handlePresignMintRequest({
         const headers = new Headers({
             "Content-Type": "application/json; charset=utf-8",
             "X-Content-Type-Options": "nosniff",
-            "Cache-Control": "no-store",
-            "Server": "s3gw"
+            "Cache-Control": "no-store"
         });
         applyCorsHeaders(headers, request, policyCorsOrigins);
         return new Response(JSON.stringify({ error: code, message }), { status, headers });
@@ -1211,8 +1210,7 @@ async function handlePresignMintRequest({
     const respHeaders = new Headers({
         "Content-Type": "application/json; charset=utf-8",
         "X-Content-Type-Options": "nosniff",
-        "Cache-Control": "no-store",
-        "Server": "s3gw"
+        "Cache-Control": "no-store"
     });
     applyCorsHeaders(respHeaders, request, licenseCorsOrigins);
 
@@ -1543,7 +1541,6 @@ function sanitizeBackendResponseHeaders(backendHeaders, license, overrides = {})
         for (const k of toDelete) {
             out.delete(k);
         }
-        out.set("Server", "s3gw");
     }
     if (overrides.contentDisposition) {
         out.set("Content-Disposition", overrides.contentDisposition);
@@ -1995,7 +1992,7 @@ async function forwardToBackend(request, originalUrl, targetPath, license, env, 
     cleanHeaders.delete("x-amz-security-token");
     cleanHeaders.set("Host", backendHost);
     cleanHeaders.set("X-Amz-Date", amzDate);
-    cleanHeaders.set("User-Agent", "s3gw/1.1.1");
+    cleanHeaders.set("User-Agent", "S3Client/1.0");
 
     let bodyToForward = (["GET", "HEAD", "DELETE"].includes(request.method) ? null : (preReadBodyBuffer !== null ? preReadBodyBuffer : request.body));
     let actualPayloadHash = payloadHash;
@@ -2012,6 +2009,11 @@ async function forwardToBackend(request, originalUrl, targetPath, license, env, 
         if (cleanHeaders.has("x-amz-decoded-content-length")) {
             cleanHeaders.set("Content-Length", cleanHeaders.get("x-amz-decoded-content-length"));
             cleanHeaders.delete("x-amz-decoded-content-length");
+        }
+        // Strip trailer headers when decoding aws-chunked streams (required for boto3 >= 1.36, AWS CLI v2.23+, AWS SDK v3, Veeam)
+        if (cleanHeaders.has("x-amz-trailer")) {
+            cleanHeaders.delete("x-amz-trailer");
+            cleanHeaders.delete("x-amz-sdk-checksum-algorithm");
         }
         const ce = cleanHeaders.get("content-encoding");
         if (ce) {
@@ -2625,8 +2627,8 @@ async function trackDlpQuotasAndQuarantine(env, licenseKey, sourceIP, license, m
 }
 
 function buildLogEntry({ licenseKey, gwHost, sourceIP, country, city, asn, asOrganization, userAgent, gwAccessKey,
-    method, s3Operation, path, bucket, contentLength, status, durationMs, authMeta, securityDecision,
-    agentId, workflowId, sessionId, canaryInfo, queryPrefix = null, queryDelimiter = null }) {
+    method, s3Operation, path, bucket, contentLength, status, durationMs, authMeta = undefined, securityDecision = undefined,
+    agentId = null, workflowId = null, sessionId = null, canaryInfo = undefined, queryPrefix = null, queryDelimiter = null }) {
     const flags = [];
     if (["deleteObject", "deleteObjects", "deleteBucket"].includes(s3Operation)) flags.push("delete_operation");
     if (["putObject", "copyObject", "uploadPart", "postObject", "createMultipartUpload", "completeMultipartUpload"].includes(s3Operation)) flags.push("write_operation");
@@ -3053,8 +3055,8 @@ function buildSyntheticListBucketsResponse(license, request, allowedOrigins = []
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Owner>
-    <ID>s3gw</ID>
-    <DisplayName>s3gw</DisplayName>
+    <ID>0000000000000000000000000000000000000000000000000000000000000001</ID>
+    <DisplayName>owner</DisplayName>
   </Owner>
   <Buckets>
     <Bucket>
@@ -3072,19 +3074,59 @@ function buildSyntheticListBucketsResponse(license, request, allowedOrigins = []
     return new Response(xml, { status: 200, headers });
 }
 
-function errorResponse(status, code, message, gwHost = "gateway.s3gw.com", request = null, allowedOrigins = []) {
-    const reqId = "s3gw-" + generateRandomHex(6);
+function generateOpaqueHostId() {
+    const bytes = new Uint8Array(56);
+    crypto.getRandomValues(bytes);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) {
+        bin += String.fromCharCode(bytes[i]);
+    }
+    return btoa(bin);
+}
+
+function genericS3ErrorMessage(code, status) {
+    switch (code) {
+        case "InvalidAccessKeyId":
+            return "The AWS Access Key Id you provided does not exist in our records.";
+        case "SignatureDoesNotMatch":
+            return "The request signature we calculated does not match the signature you provided. Check your key and signing method.";
+        case "RequestTimeTooSkewed":
+            return "The difference between the request time and the current time is too large.";
+        case "SlowDown":
+            return "Please reduce your request rate.";
+        case "InvalidURI":
+            return "Couldn't parse the specified URI.";
+        case "NoSuchBucket":
+            return "The specified bucket does not exist.";
+        case "NoSuchKey":
+            return "The specified key does not exist.";
+        case "MethodNotAllowed":
+            return "The specified method is not allowed against this resource.";
+        case "AccessDenied":
+        default:
+            if (status === 429) return "Please reduce your request rate.";
+            if (status === 400) return "Bad Request";
+            return "Access Denied";
+    }
+}
+
+function errorResponse(status, code, _internalMessage, _gwHost = "", request = null, allowedOrigins = []) {
+    const reqId = generateRandomHex(8).toUpperCase();
+    const hostId = generateOpaqueHostId();
+    const publicMessage = genericS3ErrorMessage(code, status);
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Error>
   <Code>${escapeXml(code)}</Code>
-  <Message>${escapeXml(message)}</Message>
+  <Message>${escapeXml(publicMessage)}</Message>
   <RequestId>${escapeXml(reqId)}</RequestId>
-  <HostId>${escapeXml(gwHost)}</HostId>
+  <HostId>${escapeXml(hostId)}</HostId>
 </Error>`;
     const headers = new Headers({
         "Content-Type": "application/xml; charset=utf-8",
         "X-Content-Type-Options": "nosniff",
         "Cache-Control": "no-transform, no-store",
+        "x-amz-request-id": reqId,
+        "x-amz-id-2": hostId,
     });
     applyCorsHeaders(headers, request, allowedOrigins);
     return new Response(xml, { status, headers });
@@ -3162,4 +3204,3 @@ function createAwsChunkedDecoderStream() {
         }
     });
 }
-
